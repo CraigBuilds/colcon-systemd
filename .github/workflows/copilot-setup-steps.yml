@@ -28,7 +28,5 @@ jobs:
 
       - name: Install colcon-systemd dependencies
         run: |
-          sudo apt-get install -y -q python3-pip python3-numpy
-          python3 -m pip install --break-system-packages -e ".[test]"
-          python3 -m pip install --break-system-packages \
+          python3 -m pip install --break-system-packages -e ".[test]" \
             colcon-python-setup-py colcon-bash colcon-recursive-crawl
