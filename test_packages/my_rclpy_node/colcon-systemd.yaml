@@ -1,0 +1,7 @@
+services:
+  - name: my_node
+    entry_point: my_node
+    description: "Example rclpy node managed by colcon-systemd"
+    environment:
+      ROS_DOMAIN_ID: "0"
+    restart: on-failure
