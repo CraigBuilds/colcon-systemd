@@ -40,19 +40,21 @@ def _make_job(
     package_path: Path,
     install_base: Path,
     package_type: str = "ros.ament_python",
+    merge_install: bool = False,
 ):
     """
     Create a minimal mock Job object.
 
     ``install_base`` should be the per-package prefix, matching colcon's
     isolated install layout (e.g. ``<ws>/install/<pkg>``).
+    Set ``merge_install=True`` to simulate ``colcon build --merge-install``.
     """
     pkg = SimpleNamespace(
         path=package_path,
         type=package_type,
         name=identifier,
     )
-    args = SimpleNamespace(install_base=str(install_base), merge_install=False)
+    args = SimpleNamespace(install_base=str(install_base), merge_install=merge_install)
     task_context = SimpleNamespace(pkg=pkg, args=args)
     return SimpleNamespace(task_context=task_context)
 
@@ -489,6 +491,363 @@ class TestEndToEnd:
             timeout=10,
         )
         assert result.returncode == 0
+
+
+    def test_wrapper_propagates_exit_code(self, tmp_path: Path) -> None:
+        """
+        Verify that the wrapper script propagates the node's exit code.
+
+        systemd uses the exit code to decide whether to restart a service
+        (via the Restart= policy).  If the wrapper masked a non-zero exit,
+        systemd would think the service succeeded and never restart it.
+        The wrapper uses ``exec`` which replaces the shell process, so the
+        node's exit code becomes the wrapper's exit code.
+        """
+        pkg_name = "e2e_exitcode_pkg"
+        svc_name = "e2e_failing_node"
+        install_root = tmp_path / "install"
+        install_root.mkdir()
+        install_base = install_root / pkg_name
+        install_base.mkdir()
+        pkg_path = tmp_path / "src" / pkg_name
+        pkg_path.mkdir(parents=True)
+
+        (pkg_path / "colcon-systemd.yaml").write_text(
+            textwrap.dedent(f"""\
+                services:
+                  - name: {svc_name}
+                    entry_point: {svc_name}
+                    description: "Exit code propagation test"
+                    restart: on-failure
+            """)
+        )
+
+        _setup_install_tree(
+            install_root, pkg_name, svc_name,
+            script_body=(
+                '#!/usr/bin/env bash\n'
+                'echo "NODE_STARTED"\n'
+                'exit 42\n'
+            ),
+        )
+
+        handler = SystemdEventHandler()
+        handler((_make_job_ended(pkg_name, rc=0), _make_job(pkg_name, pkg_path, install_base)))
+
+        wrapper = install_base / "share" / "colcon-systemd" / f"{svc_name}.sh"
+        assert wrapper.exists()
+
+        result = subprocess.run(
+            [str(wrapper)], capture_output=True, text=True, timeout=10
+        )
+
+        # The wrapper must not mask the node's exit code
+        assert result.returncode == 42, (
+            f"Expected exit code 42 but got {result.returncode}. "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        # The node did run before exiting
+        assert "NODE_STARTED" in result.stdout
+
+    def test_wrapper_forwards_runtime_args(self, tmp_path: Path) -> None:
+        """
+        Verify that arguments passed to the wrapper at runtime reach the node.
+
+        The wrapper uses ``exec "$executable" "$@"`` so any arguments given to
+        the wrapper process (e.g. by systemd from the ExecStart= line, or by
+        the operator directly) are forwarded verbatim to the node.
+        """
+        pkg_name = "e2e_fwdargs_pkg"
+        svc_name = "e2e_args_node"
+        install_root = tmp_path / "install"
+        install_root.mkdir()
+        install_base = install_root / pkg_name
+        install_base.mkdir()
+        pkg_path = tmp_path / "src" / pkg_name
+        pkg_path.mkdir(parents=True)
+
+        (pkg_path / "colcon-systemd.yaml").write_text(
+            textwrap.dedent(f"""\
+                services:
+                  - name: {svc_name}
+                    entry_point: {svc_name}
+                    description: "Args forwarding test"
+            """)
+        )
+
+        _setup_install_tree(
+            install_root, pkg_name, svc_name,
+            script_body=(
+                '#!/usr/bin/env bash\n'
+                'echo "ARGS: $*"\n'
+            ),
+        )
+
+        handler = SystemdEventHandler()
+        handler((_make_job_ended(pkg_name, rc=0), _make_job(pkg_name, pkg_path, install_base)))
+
+        wrapper = install_base / "share" / "colcon-systemd" / f"{svc_name}.sh"
+        assert wrapper.exists()
+
+        result = subprocess.run(
+            [str(wrapper), "--ros-args", "--param", "use_sim_time:=true"],
+            capture_output=True, text=True, timeout=10,
+        )
+
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert "--ros-args" in result.stdout
+        assert "--param" in result.stdout
+        assert "use_sim_time:=true" in result.stdout
+
+    def test_config_args_in_execstart_and_run(self, tmp_path: Path) -> None:
+        """
+        Verify that 'args' from the config appear in ExecStart and are passed
+        to the node when the wrapper is called with those arguments.
+
+        systemd reads ExecStart= and passes extra tokens to the wrapper.
+        Verifying ExecStart content plus a direct invocation with the same
+        args proves the full chain works end-to-end.
+        """
+        pkg_name = "e2e_cfgargs_pkg"
+        svc_name = "e2e_cfgargs_node"
+        install_root = tmp_path / "install"
+        install_root.mkdir()
+        install_base = install_root / pkg_name
+        install_base.mkdir()
+        pkg_path = tmp_path / "src" / pkg_name
+        pkg_path.mkdir(parents=True)
+
+        (pkg_path / "colcon-systemd.yaml").write_text(
+            textwrap.dedent(f"""\
+                services:
+                  - name: {svc_name}
+                    entry_point: {svc_name}
+                    description: "Config args test"
+                    args:
+                      - --ros-args
+                      - --param
+                      - use_sim_time:=true
+            """)
+        )
+
+        _setup_install_tree(
+            install_root, pkg_name, svc_name,
+            script_body=(
+                '#!/usr/bin/env bash\n'
+                'echo "ARGS: $*"\n'
+            ),
+        )
+
+        handler = SystemdEventHandler()
+        handler((_make_job_ended(pkg_name, rc=0), _make_job(pkg_name, pkg_path, install_base)))
+
+        wrapper = install_base / "share" / "colcon-systemd" / f"{svc_name}.sh"
+        service = install_base / "share" / "colcon-systemd" / f"{svc_name}.service"
+        assert wrapper.exists()
+        assert service.exists()
+
+        # Verify args appear in ExecStart
+        service_content = service.read_text()
+        assert "--ros-args" in service_content
+        assert "--param" in service_content
+        assert "use_sim_time:=true" in service_content
+
+        # Simulate systemd: pass the same args to the wrapper directly
+        result = subprocess.run(
+            [str(wrapper), "--ros-args", "--param", "use_sim_time:=true"],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert "--ros-args" in result.stdout
+        assert "use_sim_time:=true" in result.stdout
+
+    def test_merge_install_wrapper_runs(self, tmp_path: Path) -> None:
+        """
+        Verify that a wrapper generated in merge-install mode executes correctly.
+
+        In ``colcon build --merge-install``, all packages share a single install
+        prefix so setup.bash lives at ``<install_base>/setup.bash`` rather than
+        ``<install_base>/../setup.bash``.  The wrapper must source it from the
+        correct location.
+        """
+        pkg_name = "e2e_merge_pkg"
+        svc_name = "e2e_merge_node"
+        # In merge-install mode the install_base IS the workspace install root
+        install_base = tmp_path / "install"
+        install_base.mkdir()
+        pkg_path = tmp_path / "src" / pkg_name
+        pkg_path.mkdir(parents=True)
+
+        # setup.bash at the install root (no per-package sub-directory)
+        setup_bash = install_base / "setup.bash"
+        setup_bash.write_text(
+            '#!/usr/bin/env bash\n'
+            'export MERGE_INSTALL_SOURCED="1"\n'
+        )
+        setup_bash.chmod(0o755)
+
+        # Executable at install_base/lib/<pkg>/<ep>
+        ep_dir = install_base / "lib" / pkg_name
+        ep_dir.mkdir(parents=True)
+        ep = ep_dir / svc_name
+        ep.write_text(
+            '#!/usr/bin/env bash\n'
+            'echo "MERGE_INSTALL_SOURCED=${MERGE_INSTALL_SOURCED}"\n'
+            'echo "MERGE_NODE_RUNNING"\n'
+        )
+        ep.chmod(0o755)
+
+        (pkg_path / "colcon-systemd.yaml").write_text(
+            textwrap.dedent(f"""\
+                services:
+                  - name: {svc_name}
+                    entry_point: {svc_name}
+                    description: "Merge install test"
+            """)
+        )
+
+        handler = SystemdEventHandler()
+        job = _make_job(pkg_name, pkg_path, install_base, merge_install=True)
+        handler((_make_job_ended(pkg_name, rc=0), job))
+
+        wrapper = install_base / "share" / "colcon-systemd" / f"{svc_name}.sh"
+        assert wrapper.exists()
+
+        # The wrapper must reference the setup.bash inside install_base,
+        # not one level up
+        wrapper_content = wrapper.read_text()
+        assert str(install_base / "setup.bash") in wrapper_content
+
+        result = subprocess.run(
+            [str(wrapper)], capture_output=True, text=True, timeout=10
+        )
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert "MERGE_NODE_RUNNING" in result.stdout
+        assert "MERGE_INSTALL_SOURCED=1" in result.stdout
+
+    def test_two_packages_dont_interfere(self, tmp_path: Path) -> None:
+        """
+        Verify that two packages with the same service name are fully isolated.
+
+        colcon uses a separate install prefix per package in isolated mode.
+        Services from pkg_a and pkg_b must not overwrite each other's generated
+        files even when they share the same service name.
+        """
+        install_root = tmp_path / "install"
+        install_root.mkdir()
+        packages = [
+            ("pkg_a", "PKG_A_WORKER"),
+            ("pkg_b", "PKG_B_WORKER"),
+        ]
+
+        install_bases = {}
+        pkg_paths = {}
+        for pkg_name, marker in packages:
+            pkg_path = tmp_path / "src" / pkg_name
+            pkg_path.mkdir(parents=True)
+            install_base = install_root / pkg_name
+            install_base.mkdir()
+            pkg_paths[pkg_name] = pkg_path
+            install_bases[pkg_name] = install_base
+
+            (pkg_path / "colcon-systemd.yaml").write_text(
+                textwrap.dedent(f"""\
+                    services:
+                      - name: worker
+                        entry_point: worker
+                        description: "Worker for {pkg_name}"
+                """)
+            )
+            _setup_install_tree(
+                install_root, pkg_name, "worker",
+                script_body=(
+                    '#!/usr/bin/env bash\n'
+                    f'echo "{marker}"\n'
+                ),
+            )
+
+        # Fire the event handler for both packages
+        handler = SystemdEventHandler()
+        for pkg_name, _ in packages:
+            handler((
+                _make_job_ended(pkg_name, rc=0),
+                _make_job(pkg_name, pkg_paths[pkg_name], install_bases[pkg_name]),
+            ))
+
+        # Each package has its own set of generated files
+        wrapper_a = install_bases["pkg_a"] / "share" / "colcon-systemd" / "worker.sh"
+        wrapper_b = install_bases["pkg_b"] / "share" / "colcon-systemd" / "worker.sh"
+        assert wrapper_a.exists(), "pkg_a worker.sh not generated"
+        assert wrapper_b.exists(), "pkg_b worker.sh not generated"
+        # Files are distinct (different paths)
+        assert wrapper_a != wrapper_b
+
+        result_a = subprocess.run(
+            [str(wrapper_a)], capture_output=True, text=True, timeout=10
+        )
+        result_b = subprocess.run(
+            [str(wrapper_b)], capture_output=True, text=True, timeout=10
+        )
+        assert result_a.returncode == 0
+        assert result_b.returncode == 0
+
+        # Each wrapper produces only its own marker — no cross-contamination
+        assert "PKG_A_WORKER" in result_a.stdout
+        assert "PKG_B_WORKER" not in result_a.stdout
+        assert "PKG_B_WORKER" in result_b.stdout
+        assert "PKG_A_WORKER" not in result_b.stdout
+
+    def test_wrapper_stdout_stderr_passthrough(self, tmp_path: Path) -> None:
+        """
+        Verify the wrapper does not swallow node stdout or stderr.
+
+        systemd captures the service's stdout/stderr for journald.  If the
+        wrapper swallowed either stream, operators would lose diagnostic output
+        from their ROS 2 nodes (e.g. rosout, warnings, error traces).
+        """
+        pkg_name = "e2e_stdio_pkg"
+        svc_name = "e2e_stdio_node"
+        install_root = tmp_path / "install"
+        install_root.mkdir()
+        install_base = install_root / pkg_name
+        install_base.mkdir()
+        pkg_path = tmp_path / "src" / pkg_name
+        pkg_path.mkdir(parents=True)
+
+        (pkg_path / "colcon-systemd.yaml").write_text(
+            textwrap.dedent(f"""\
+                services:
+                  - name: {svc_name}
+                    entry_point: {svc_name}
+                    description: "Stdio passthrough test"
+            """)
+        )
+
+        _setup_install_tree(
+            install_root, pkg_name, svc_name,
+            script_body=(
+                '#!/usr/bin/env bash\n'
+                'echo "STDOUT_MESSAGE"\n'
+                'echo "STDERR_MESSAGE" >&2\n'
+            ),
+        )
+
+        handler = SystemdEventHandler()
+        handler((_make_job_ended(pkg_name, rc=0), _make_job(pkg_name, pkg_path, install_base)))
+
+        wrapper = install_base / "share" / "colcon-systemd" / f"{svc_name}.sh"
+        assert wrapper.exists()
+
+        result = subprocess.run(
+            [str(wrapper)], capture_output=True, text=True, timeout=10
+        )
+        assert result.returncode == 0
+        assert "STDOUT_MESSAGE" in result.stdout, (
+            f"stdout was swallowed: {result.stdout!r}"
+        )
+        assert "STDERR_MESSAGE" in result.stderr, (
+            f"stderr was swallowed: {result.stderr!r}"
+        )
 
 
 def _systemd_analyze_available() -> bool:
