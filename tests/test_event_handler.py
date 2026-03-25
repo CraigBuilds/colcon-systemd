@@ -263,11 +263,19 @@ class TestSystemdEventHandler:
         )
 
         import logging
-        with caplog.at_level(logging.WARNING):
-            handler((event_data, job))
+        # Attach caplog's handler directly to the specific logger so that
+        # records are captured regardless of propagation settings in the
+        # test environment (e.g. ros:jazzy may configure logging differently).
+        event_handler_logger = logging.getLogger("colcon_systemd.event_handler")
+        event_handler_logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.WARNING, logger="colcon_systemd.event_handler"):
+                handler((event_data, job))
+        finally:
+            event_handler_logger.removeHandler(caplog.handler)
 
         # Files should still be generated
         output_dir = install_base / "share" / "colcon-systemd"
         assert (output_dir / "my_node.service").exists()
         # Warning should be logged
-        assert any("custom_type" in r.message for r in caplog.records)
+        assert any("custom_type" in r.getMessage() for r in caplog.records)

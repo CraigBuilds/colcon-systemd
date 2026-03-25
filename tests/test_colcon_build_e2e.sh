@@ -56,11 +56,15 @@ echo "[1/6] Setting up workspace..."
 mkdir -p "$WORKSPACE/src"
 cp -r "$REPO_ROOT/test_packages/$PKG_NAME" "$WORKSPACE/src/$PKG_NAME"
 
-# Ensure colcon-systemd is installed
-pip install -e "$REPO_ROOT" --quiet 2>&1 | tail -1
+# Ensure colcon-systemd is installed.
+# --break-system-packages is required when running inside the ros:jazzy
+# Docker container (Ubuntu 24.04), which enforces PEP 668.  The container
+# is a fully isolated test environment, so bypassing the guard is safe.
+pip install -e "$REPO_ROOT" --quiet --break-system-packages 2>&1 | tail -1
 # Ensure colcon can build Python packages, discover them recursively,
 # and generate setup.bash
-pip install colcon-python-setup-py colcon-bash colcon-recursive-crawl --quiet 2>&1 | tail -1
+pip install colcon-python-setup-py colcon-bash colcon-recursive-crawl \
+    --quiet --break-system-packages 2>&1 | tail -1
 
 echo "  Workspace ready."
 
