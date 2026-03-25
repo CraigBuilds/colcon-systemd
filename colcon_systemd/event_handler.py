@@ -86,6 +86,7 @@ class SystemdEventHandler(EventHandlerExtensionPoint):
             return
 
         install_base = Path(install_base_str).resolve()
+        merge_install = getattr(args, "merge_install", False)
         package_path = Path(str(pkg.path)).resolve()
 
         # Look for colcon-systemd.yaml
@@ -125,6 +126,7 @@ class SystemdEventHandler(EventHandlerExtensionPoint):
                     package_name=package_name,
                     service=service,
                     package_type=package_type,
+                    merge_install=merge_install,
                 )
                 if service_path:
                     self._generated.append(service_path)

@@ -41,19 +41,24 @@ def _make_job(
     install_base: Path,
     package_type: str = "ros.ament_python",
 ):
-    """Create a minimal mock Job object."""
+    """
+    Create a minimal mock Job object.
+
+    ``install_base`` should be the per-package prefix, matching colcon's
+    isolated install layout (e.g. ``<ws>/install/<pkg>``).
+    """
     pkg = SimpleNamespace(
         path=package_path,
         type=package_type,
         name=identifier,
     )
-    args = SimpleNamespace(install_base=str(install_base))
+    args = SimpleNamespace(install_base=str(install_base), merge_install=False)
     task_context = SimpleNamespace(pkg=pkg, args=args)
     return SimpleNamespace(task_context=task_context)
 
 
 def _setup_install_tree(
-    install_base: Path,
+    install_root: Path,
     package_name: str,
     entry_point_name: str,
     script_body: str,
@@ -62,21 +67,24 @@ def _setup_install_tree(
     Create a simulated colcon install tree with a real executable.
 
     Sets up:
-      <install_base>/setup.bash          — trivial env sourcing script
-      <install_base>/<pkg>/lib/<pkg>/<ep> — executable entry point
+      <install_root>/setup.bash                     — workspace env script
+      <install_root>/<pkg>/lib/<pkg>/<entry_point>   — executable
 
     Returns the path to the entry point executable.
     """
-    # Create setup.bash that exports a marker variable
-    setup_bash = install_base / "setup.bash"
-    setup_bash.write_text(
-        '#!/usr/bin/env bash\n'
-        'export COLCON_SYSTEMD_E2E_SOURCED="1"\n'
-    )
-    setup_bash.chmod(0o755)
+    # Create workspace-level setup.bash that exports a marker variable
+    setup_bash = install_root / "setup.bash"
+    if not setup_bash.exists():
+        setup_bash.write_text(
+            '#!/usr/bin/env bash\n'
+            'export COLCON_SYSTEMD_E2E_SOURCED="1"\n'
+        )
+        setup_bash.chmod(0o755)
 
-    # Create the entry point executable
-    ep_dir = install_base / package_name / "lib" / package_name
+    # Create the per-package install prefix and entry point
+    pkg_prefix = install_root / package_name
+    pkg_prefix.mkdir(parents=True, exist_ok=True)
+    ep_dir = pkg_prefix / "lib" / package_name
     ep_dir.mkdir(parents=True, exist_ok=True)
     ep_path = ep_dir / entry_point_name
     ep_path.write_text(script_body)
@@ -97,7 +105,9 @@ class TestEndToEnd:
         """
         pkg_name = "e2e_test_pkg"
         svc_name = "e2e_node"
-        install_base = tmp_path / "install"
+        install_root = tmp_path / "install"
+        install_root.mkdir()
+        install_base = install_root / pkg_name
         install_base.mkdir()
         pkg_path = tmp_path / "src" / pkg_name
         pkg_path.mkdir(parents=True)
@@ -116,7 +126,7 @@ class TestEndToEnd:
 
         # 2. Create a real executable that prints a marker and exits
         _setup_install_tree(
-            install_base,
+            install_root,
             pkg_name,
             svc_name,
             script_body=(
@@ -134,9 +144,7 @@ class TestEndToEnd:
         handler((event_data, job))
 
         # 4. Verify files were generated
-        output_dir = (
-            install_base / pkg_name / "share" / "colcon-systemd"
-        )
+        output_dir = install_base / "share" / "colcon-systemd"
         service_file = output_dir / f"{svc_name}.service"
         wrapper_file = output_dir / f"{svc_name}.sh"
 
@@ -191,7 +199,9 @@ class TestEndToEnd:
         """
         pkg_name = "e2e_daemon_pkg"
         svc_name = "e2e_daemon"
-        install_base = tmp_path / "install"
+        install_root = tmp_path / "install"
+        install_root.mkdir()
+        install_base = install_root / pkg_name
         install_base.mkdir()
         pkg_path = tmp_path / "src" / pkg_name
         pkg_path.mkdir(parents=True)
@@ -211,7 +221,7 @@ class TestEndToEnd:
 
         # 2. Create a long-running executable that writes PID and loops
         _setup_install_tree(
-            install_base,
+            install_root,
             pkg_name,
             svc_name,
             script_body=(
@@ -234,7 +244,7 @@ class TestEndToEnd:
         handler((event_data, job))
 
         # 4. Verify files were generated
-        output_dir = install_base / pkg_name / "share" / "colcon-systemd"
+        output_dir = install_base / "share" / "colcon-systemd"
         wrapper_file = output_dir / f"{svc_name}.sh"
         service_file = output_dir / f"{svc_name}.service"
         assert service_file.exists()
@@ -300,7 +310,9 @@ class TestEndToEnd:
 
         pkg_name = "e2e_verify_pkg"
         svc_name = "e2e_verify_node"
-        install_base = tmp_path / "install"
+        install_root = tmp_path / "install"
+        install_root.mkdir()
+        install_base = install_root / pkg_name
         install_base.mkdir()
         pkg_path = tmp_path / "src" / pkg_name
         pkg_path.mkdir(parents=True)
@@ -317,7 +329,7 @@ class TestEndToEnd:
         """))
 
         _setup_install_tree(
-            install_base, pkg_name, svc_name,
+            install_root, pkg_name, svc_name,
             script_body='#!/usr/bin/env bash\necho ok\n',
         )
 
@@ -327,7 +339,7 @@ class TestEndToEnd:
         handler((event_data, job))
 
         service_file = (
-            install_base / pkg_name / "share" / "colcon-systemd"
+            install_base / "share" / "colcon-systemd"
             / f"{svc_name}.service"
         )
         assert service_file.exists()
@@ -360,7 +372,9 @@ class TestEndToEnd:
         all wrapper scripts execute successfully.
         """
         pkg_name = "e2e_multi_pkg"
-        install_base = tmp_path / "install"
+        install_root = tmp_path / "install"
+        install_root.mkdir()
+        install_base = install_root / pkg_name
         install_base.mkdir()
         pkg_path = tmp_path / "src" / pkg_name
         pkg_path.mkdir(parents=True)
@@ -379,7 +393,7 @@ class TestEndToEnd:
         # Create both executables
         for name in ("node_alpha", "node_beta"):
             _setup_install_tree(
-                install_base, pkg_name, name,
+                install_root, pkg_name, name,
                 script_body=(
                     '#!/usr/bin/env bash\n'
                     f'echo "{name.upper()}_RUNNING"\n'
@@ -393,7 +407,7 @@ class TestEndToEnd:
         handler((event_data, job))
 
         # Verify both services generated and runnable
-        output_dir = install_base / pkg_name / "share" / "colcon-systemd"
+        output_dir = install_base / "share" / "colcon-systemd"
         for name in ("node_alpha", "node_beta"):
             wrapper = output_dir / f"{name}.sh"
             service = output_dir / f"{name}.service"
@@ -413,12 +427,14 @@ class TestEndToEnd:
 
     def test_environment_propagation(self, tmp_path: Path) -> None:
         """
-        Verify that environment variables from the config are available
-        inside the running service process.
+        Verify that environment variables from the config appear as
+        Environment= directives in the generated .service file.
         """
         pkg_name = "e2e_env_pkg"
         svc_name = "e2e_env_node"
-        install_base = tmp_path / "install"
+        install_root = tmp_path / "install"
+        install_root.mkdir()
+        install_base = install_root / pkg_name
         install_base.mkdir()
         pkg_path = tmp_path / "src" / pkg_name
         pkg_path.mkdir(parents=True)
@@ -435,7 +451,7 @@ class TestEndToEnd:
 
         # The executable prints environment variables it receives
         _setup_install_tree(
-            install_base, pkg_name, svc_name,
+            install_root, pkg_name, svc_name,
             script_body=(
                 '#!/usr/bin/env bash\n'
                 'echo "ROS_DOMAIN_ID=${ROS_DOMAIN_ID}"\n'
@@ -449,7 +465,7 @@ class TestEndToEnd:
         handler((event_data, job))
 
         wrapper = (
-            install_base / pkg_name / "share" / "colcon-systemd"
+            install_base / "share" / "colcon-systemd"
             / f"{svc_name}.sh"
         )
         assert wrapper.exists()
@@ -459,7 +475,7 @@ class TestEndToEnd:
         # the .service file contains the right directives, and the
         # wrapper script runs the right executable.
         service_content = (
-            install_base / pkg_name / "share" / "colcon-systemd"
+            install_base / "share" / "colcon-systemd"
             / f"{svc_name}.service"
         ).read_text()
         assert 'Environment="ROS_DOMAIN_ID=42"' in service_content

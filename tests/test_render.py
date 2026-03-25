@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0
 """Tests for colcon_systemd.render module."""
 
+import stat
 from pathlib import Path
 
 import pytest
@@ -15,9 +16,22 @@ from colcon_systemd.render import (
 
 
 @pytest.fixture()
-def install_base(tmp_path: Path) -> Path:
-    """Create a mock install base directory."""
-    base = tmp_path / "install"
+def install_root(tmp_path: Path) -> Path:
+    """Create the workspace-level install directory."""
+    root = tmp_path / "install"
+    root.mkdir()
+    return root
+
+
+@pytest.fixture()
+def install_base(install_root: Path) -> Path:
+    """
+    Per-package install prefix matching colcon's isolated mode.
+
+    In isolated mode (the default), colcon sets
+    ``args.install_base = <ws>/install/<pkg>``.
+    """
+    base = install_root / "my_pkg"
     base.mkdir()
     return base
 
@@ -35,15 +49,15 @@ def _make_service(**overrides) -> ServiceConfig:
 class TestRenderWrapperScript:
     """Tests for wrapper script rendering."""
 
-    def test_basic_wrapper(self, install_base: Path) -> None:
+    def test_basic_wrapper(self, install_root: Path, install_base: Path) -> None:
         svc = _make_service()
         script = render_wrapper_script(
             install_base, "my_pkg", svc, "ros.ament_python"
         )
         assert "#!/usr/bin/env bash" in script
-        assert f'source "{install_base}/setup.bash"' in script
-        assert f'exec "{install_base}/my_pkg/lib/my_pkg/my_node"' in script
-        assert "set -euo pipefail" in script
+        assert f'source "{install_root}/setup.bash"' in script
+        assert f'exec "{install_base}/lib/my_pkg/my_node"' in script
+        assert "set -eo pipefail" in script
 
     def test_executable_variant(self, install_base: Path) -> None:
         svc = _make_service(entry_point=None, executable="talker_node")
@@ -51,6 +65,15 @@ class TestRenderWrapperScript:
             install_base, "my_pkg", svc, "cmake"
         )
         assert "talker_node" in script
+
+    def test_merge_install_setup_bash(self, install_root: Path) -> None:
+        """In merge-install mode, setup.bash is in install_base itself."""
+        svc = _make_service()
+        script = render_wrapper_script(
+            install_root, "my_pkg", svc, "ros.ament_python",
+            merge_install=True,
+        )
+        assert f'source "{install_root}/setup.bash"' in script
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +85,7 @@ class TestRenderServiceUnit:
 
     def test_basic_unit(self, install_base: Path) -> None:
         svc = _make_service(description="Test node")
-        wrapper_path = install_base / "my_pkg" / "share" / "colcon-systemd" / "my_node.sh"
+        wrapper_path = install_base / "share" / "colcon-systemd" / "my_node.sh"
         unit = render_service_unit(
             install_base, "my_pkg", svc, "ros.ament_python", wrapper_path
         )
@@ -134,12 +157,11 @@ class TestWriteServiceFiles:
         assert service_path.exists()
 
         wrapper_path = (
-            install_base / "my_pkg" / "share" / "colcon-systemd" / "my_node.sh"
+            install_base / "share" / "colcon-systemd" / "my_node.sh"
         )
         assert wrapper_path.exists()
 
         # Wrapper should be executable
-        import stat
         mode = wrapper_path.stat().st_mode
         assert mode & stat.S_IXUSR
 

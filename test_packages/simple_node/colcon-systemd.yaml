@@ -1,0 +1,7 @@
+services:
+  - name: simple_node
+    entry_point: simple_node
+    description: "Simple test node for colcon build integration testing"
+    environment:
+      TEST_ENV_VAR: "colcon_systemd_works"
+    restart: on-failure

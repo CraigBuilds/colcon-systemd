@@ -25,13 +25,18 @@ def _make_job(
     install_base: Path,
     package_type: str = "ros.ament_python",
 ):
-    """Create a minimal mock Job object."""
+    """
+    Create a minimal mock Job object.
+
+    ``install_base`` should be the per-package prefix, matching colcon's
+    isolated install layout (e.g. ``<ws>/install/<pkg>``).
+    """
     pkg = SimpleNamespace(
         path=package_path,
         type=package_type,
         name=identifier,
     )
-    args = SimpleNamespace(install_base=str(install_base))
+    args = SimpleNamespace(install_base=str(install_base), merge_install=False)
     task_context = SimpleNamespace(pkg=pkg, args=args)
     job = SimpleNamespace(task_context=task_context)
     return job
@@ -59,8 +64,8 @@ class TestSystemdEventHandler:
         handler = SystemdEventHandler()
         pkg_path = tmp_path / "my_pkg"
         pkg_path.mkdir()
-        install_base = tmp_path / "install"
-        install_base.mkdir()
+        install_base = tmp_path / "install" / "my_pkg"
+        install_base.mkdir(parents=True)
 
         _write_config(pkg_path, """\
             services:
@@ -73,7 +78,7 @@ class TestSystemdEventHandler:
         handler((event_data, job))
 
         # No files should be generated for failed builds
-        output_dir = install_base / "my_pkg" / "share" / "colcon-systemd"
+        output_dir = install_base / "share" / "colcon-systemd"
         assert not output_dir.exists()
 
     @pytest.mark.skipif(
@@ -84,14 +89,14 @@ class TestSystemdEventHandler:
         handler = SystemdEventHandler()
         pkg_path = tmp_path / "my_pkg"
         pkg_path.mkdir()
-        install_base = tmp_path / "install"
-        install_base.mkdir()
+        install_base = tmp_path / "install" / "my_pkg"
+        install_base.mkdir(parents=True)
 
         event_data = _make_job_ended("my_pkg", rc=0)
         job = _make_job("my_pkg", pkg_path, install_base)
         handler((event_data, job))
 
-        output_dir = install_base / "my_pkg" / "share" / "colcon-systemd"
+        output_dir = install_base / "share" / "colcon-systemd"
         assert not output_dir.exists()
 
     @pytest.mark.skipif(
@@ -104,8 +109,8 @@ class TestSystemdEventHandler:
         handler = SystemdEventHandler()
         pkg_path = tmp_path / "my_pkg"
         pkg_path.mkdir()
-        install_base = tmp_path / "install"
-        install_base.mkdir()
+        install_base = tmp_path / "install" / "my_pkg"
+        install_base.mkdir(parents=True)
 
         _write_config(pkg_path, """\
             services:
@@ -118,7 +123,7 @@ class TestSystemdEventHandler:
         job = _make_job("my_pkg", pkg_path, install_base)
         handler((event_data, job))
 
-        output_dir = install_base / "my_pkg" / "share" / "colcon-systemd"
+        output_dir = install_base / "share" / "colcon-systemd"
         assert output_dir.exists()
         assert (output_dir / "my_node.service").exists()
         assert (output_dir / "my_node.sh").exists()
@@ -136,8 +141,8 @@ class TestSystemdEventHandler:
         handler = SystemdEventHandler()
         pkg_path = tmp_path / "my_pkg"
         pkg_path.mkdir()
-        install_base = tmp_path / "install"
-        install_base.mkdir()
+        install_base = tmp_path / "install" / "my_pkg"
+        install_base.mkdir(parents=True)
 
         _write_config(pkg_path, """\
             services:
@@ -151,7 +156,7 @@ class TestSystemdEventHandler:
         job = _make_job("my_pkg", pkg_path, install_base)
         handler((event_data, job))
 
-        output_dir = install_base / "my_pkg" / "share" / "colcon-systemd"
+        output_dir = install_base / "share" / "colcon-systemd"
         assert (output_dir / "node_a.service").exists()
         assert (output_dir / "node_b.service").exists()
         assert (output_dir / "node_a.sh").exists()
@@ -167,8 +172,8 @@ class TestSystemdEventHandler:
         handler = SystemdEventHandler()
         pkg_path = tmp_path / "my_pkg"
         pkg_path.mkdir()
-        install_base = tmp_path / "install"
-        install_base.mkdir()
+        install_base = tmp_path / "install" / "my_pkg"
+        install_base.mkdir(parents=True)
 
         _write_config(pkg_path, """\
             services:
@@ -187,8 +192,8 @@ class TestSystemdEventHandler:
         handler = SystemdEventHandler()
         pkg_path = tmp_path / "my_pkg"
         pkg_path.mkdir()
-        install_base = tmp_path / "install"
-        install_base.mkdir()
+        install_base = tmp_path / "install" / "my_pkg"
+        install_base.mkdir(parents=True)
 
         _write_config(pkg_path, """\
             services:
@@ -203,7 +208,7 @@ class TestSystemdEventHandler:
             mock_platform.system.return_value = "Darwin"
             handler((event_data, job))
 
-        output_dir = install_base / "my_pkg" / "share" / "colcon-systemd"
+        output_dir = install_base / "share" / "colcon-systemd"
         assert not output_dir.exists()
 
     @pytest.mark.skipif(
@@ -243,8 +248,8 @@ class TestSystemdEventHandler:
         handler = SystemdEventHandler()
         pkg_path = tmp_path / "my_pkg"
         pkg_path.mkdir()
-        install_base = tmp_path / "install"
-        install_base.mkdir()
+        install_base = tmp_path / "install" / "my_pkg"
+        install_base.mkdir(parents=True)
 
         _write_config(pkg_path, """\
             services:
@@ -262,7 +267,7 @@ class TestSystemdEventHandler:
             handler((event_data, job))
 
         # Files should still be generated
-        output_dir = install_base / "my_pkg" / "share" / "colcon-systemd"
+        output_dir = install_base / "share" / "colcon-systemd"
         assert (output_dir / "my_node.service").exists()
         # Warning should be logged
         assert any("custom_type" in r.message for r in caplog.records)
