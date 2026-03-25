@@ -3,11 +3,11 @@
 #
 # This script:
 #   1. Creates a temporary colcon workspace
-#   2. Builds the simple_node test package with colcon build
+#   2. Builds the simple_node ROS 2 test package with colcon build
 #   3. Verifies that .service and .sh files were generated at the correct paths
 #   4. Validates the .service file content
-#   5. Runs the wrapper script and checks the node actually executes
-#   6. Starts the node as a daemon, verifies it is running, then stops it
+#   5. Installs the .service file, starts it via systemctl --user, verifies the
+#      ROS 2 node is visible on the graph, and stops it via systemctl --user
 #
 # Exit codes: 0 = all checks passed, 1 = a check failed.
 # Usage:  bash tests/test_colcon_build_e2e.sh
@@ -19,13 +19,18 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORKSPACE="$(mktemp -d)"
 PKG_NAME="simple_node"
 SVC_NAME="simple_node"
+# Use a unique unit name to avoid collisions with any real deployment.
+SERVICE_UNIT="colcon_systemd_simple_node_test"
+SYSTEMD_USER_PID=""
 
 cleanup() {
-    if [[ -n "${DAEMON_PID:-}" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
-        kill "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
-    fi
+    systemctl --user stop "$SERVICE_UNIT" 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/${SERVICE_UNIT}.service"
+    systemctl --user daemon-reload 2>/dev/null || true
     rm -rf "$WORKSPACE"
+    if [[ -n "${SYSTEMD_USER_PID:-}" ]]; then
+        kill "$SYSTEMD_USER_PID" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 
@@ -52,7 +57,7 @@ echo ""
 # ---------------------------------------------------------------
 # Step 1: Set up workspace
 # ---------------------------------------------------------------
-echo "[1/6] Setting up workspace..."
+echo "[1/5] Setting up workspace..."
 mkdir -p "$WORKSPACE/src"
 cp -r "$REPO_ROOT/test_packages/$PKG_NAME" "$WORKSPACE/src/$PKG_NAME"
 
@@ -62,16 +67,64 @@ cp -r "$REPO_ROOT/test_packages/$PKG_NAME" "$WORKSPACE/src/$PKG_NAME"
 # is a fully isolated test environment, so bypassing the guard is safe.
 pip install -e "$REPO_ROOT" --quiet --break-system-packages 2>&1 | tail -1
 # Ensure colcon can build Python packages, discover them recursively,
-# and generate setup.bash
-pip install colcon-python-setup-py colcon-bash colcon-recursive-crawl \
+# generate setup.bash, and chain the ROS underlay (colcon-ros).
+pip install colcon-python-setup-py colcon-bash colcon-recursive-crawl colcon-ros \
     --quiet --break-system-packages 2>&1 | tail -1
+
+# ROS 2 is required for this test.
+if [[ -z "${ROS_SETUP:-}" ]]; then
+    for distro_dir in /opt/ros/*/; do
+        if [[ -f "${distro_dir}setup.bash" ]]; then
+            ROS_SETUP="${distro_dir}setup.bash"
+            break
+        fi
+    done
+fi
+
+if [[ -z "${ROS_SETUP:-}" ]]; then
+    echo "FAIL: ROS 2 not found in /opt/ros/ — ROS 2 is required for this test"
+    exit 1
+fi
+
+echo "  Found ROS 2: $ROS_SETUP"
+# shellcheck source=/dev/null
+source "$ROS_SETUP"
+
+# Ensure a user systemd session is available (needed for systemctl --user).
+# In container/CI environments the session may not be started automatically;
+# in that case we start D-Bus and systemd --user ourselves.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+mkdir -p "$XDG_RUNTIME_DIR"
+
+SYSTEMD_STATE=$(systemctl --user is-system-running 2>/dev/null || true)
+if [[ ! "$SYSTEMD_STATE" =~ ^(running|degraded)$ ]]; then
+    echo "  User systemd not running — starting session..."
+    if [[ ! -S "$XDG_RUNTIME_DIR/bus" ]]; then
+        /usr/bin/dbus-daemon --session \
+            --address="unix:path=$XDG_RUNTIME_DIR/bus" \
+            --fork --nopidfile 2>/dev/null || true
+        sleep 0.3
+    fi
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+    /usr/lib/systemd/systemd --user 2>/dev/null &
+    SYSTEMD_USER_PID=$!
+    DEADLINE=$((SECONDS + 10))
+    until [[ $(systemctl --user is-system-running 2>/dev/null || true) =~ ^(running|degraded)$ ]]; do
+        if [[ $SECONDS -ge $DEADLINE ]]; then
+            echo "ABORT: could not start user systemd session within 10 s"
+            exit 1
+        fi
+        sleep 0.5
+    done
+    echo "  User systemd session started."
+fi
 
 echo "  Workspace ready."
 
 # ---------------------------------------------------------------
 # Step 2: colcon build
 # ---------------------------------------------------------------
-echo "[2/6] Running colcon build..."
+echo "[2/5] Running colcon build..."
 cd "$WORKSPACE"
 set +e
 BUILD_OUTPUT=$(colcon build 2>&1)
@@ -99,7 +152,7 @@ echo ""
 # ---------------------------------------------------------------
 # Step 3: Verify generated artifacts exist
 # ---------------------------------------------------------------
-echo "[3/6] Checking generated artifacts..."
+echo "[3/5] Checking generated artifacts..."
 
 SERVICE_FILE="$WORKSPACE/install/$PKG_NAME/share/colcon-systemd/$SVC_NAME.service"
 WRAPPER_FILE="$WORKSPACE/install/$PKG_NAME/share/colcon-systemd/$SVC_NAME.sh"
@@ -117,7 +170,7 @@ echo ""
 # ---------------------------------------------------------------
 # Step 4: Validate .service file content
 # ---------------------------------------------------------------
-echo "[4/6] Validating .service file content..."
+echo "[4/5] Validating .service file content..."
 
 check "[Unit] section present"       grep -q "^\[Unit\]"    "$SERVICE_FILE"
 check "[Service] section present"    grep -q "^\[Service\]" "$SERVICE_FILE"
@@ -142,65 +195,100 @@ fi
 echo ""
 
 # ---------------------------------------------------------------
-# Step 5: Run the wrapper script (one-shot)
+# Step 5: Start via systemctl --user, verify ROS 2 node is running, then stop
 # ---------------------------------------------------------------
-echo "[5/6] Running wrapper script (one-shot)..."
+echo "[5/5] Starting .service via systemctl --user..."
 
-RUN_OUTPUT=$("$WRAPPER_FILE" 2>&1)
-RUN_RC=$?
-
-check "wrapper script exits with rc=0" test "$RUN_RC" -eq 0
-if echo "$RUN_OUTPUT" | grep -q "SIMPLE_NODE_RUNNING"; then
-    check "node produces expected output" true
+# Resolve the ros2 CLI binary.
+if command -v ros2 &>/dev/null; then
+    ROS2_BIN="ros2"
 else
-    check "node produces expected output" false
+    ROS2_BIN="$(dirname "$ROS_SETUP")/bin/ros2"
 fi
 
-echo ""
+# Install the generated .service file under a test-specific unit name and start it.
+USER_UNIT_DIR="$HOME/.config/systemd/user"
+mkdir -p "$USER_UNIT_DIR"
+cp "$SERVICE_FILE" "$USER_UNIT_DIR/${SERVICE_UNIT}.service"
+systemctl --user daemon-reload
+systemctl --user start "${SERVICE_UNIT}.service"
 
-# ---------------------------------------------------------------
-# Step 6: Run as daemon, verify it is running, then stop it
-# ---------------------------------------------------------------
-echo "[6/6] Running as daemon service..."
+check "service started (systemctl --user start)" true
 
-DAEMON_OUT="$WORKSPACE/daemon.out"
-"$WRAPPER_FILE" --daemon > "$DAEMON_OUT" 2>&1 &
-DAEMON_PID=$!
-
-# Wait up to 5 seconds for the daemon to start
+# Wait up to 5 s for the service to become active
 DEADLINE=$((SECONDS + 5))
-STARTED=false
-while [ $SECONDS -lt $DEADLINE ]; do
-    if grep -q "SIMPLE_NODE_RUNNING" "$DAEMON_OUT" 2>/dev/null; then
-        STARTED=true
+ACTIVE=false
+while [[ $SECONDS -lt $DEADLINE ]]; do
+    if [[ "$(systemctl --user is-active "${SERVICE_UNIT}" 2>/dev/null || true)" == "active" ]]; then
+        ACTIVE=true
         break
     fi
     sleep 0.2
 done
 
-check "daemon started within 5 seconds" $STARTED
+check "service is active after start" $ACTIVE
 
-if $STARTED; then
-    # Verify the process is actually running
-    check "daemon PID is alive" kill -0 "$DAEMON_PID" 2>/dev/null
+if $ACTIVE; then
+    # Verify the ROS 2 node is visible on the graph
+    NODE_READY=false
+    DEADLINE=$((SECONDS + 15))
+    while [[ $SECONDS -lt $DEADLINE ]]; do
+        if "$ROS2_BIN" node list 2>/dev/null | grep -q "/simple_node"; then
+            NODE_READY=true
+            break
+        fi
+        sleep 0.5
+    done
 
-    # Wait for heartbeat
-    sleep 1
-    HEARTBEAT_COUNT=$(grep -c "SIMPLE_NODE_HEARTBEAT" "$DAEMON_OUT" 2>/dev/null || echo 0)
-    check "daemon produced heartbeat output (count=$HEARTBEAT_COUNT)" \
-        test "$HEARTBEAT_COUNT" -ge 1
+    check "ROS 2 node /simple_node is visible on the graph" $NODE_READY
 
-    # Send SIGTERM and verify graceful shutdown
-    kill "$DAEMON_PID" 2>/dev/null
-    wait "$DAEMON_PID" 2>/dev/null || true
-    sleep 0.5
+    if $NODE_READY; then
+        # Allow DDS discovery to propagate before subscribing
+        sleep 0.5
 
-    check "daemon handled SIGTERM gracefully" \
-        grep -q "SIMPLE_NODE_STOPPED" "$DAEMON_OUT"
+        ECHO_OUT=$(
+            "$ROS2_BIN" topic echo /simple_node/chatter std_msgs/msg/String --once \
+                2>/dev/null
+        )
+        if echo "$ECHO_OUT" | grep -q "^data:"; then
+            check "ROS 2 node is publishing on /simple_node/chatter" true
+        else
+            check "ROS 2 node is publishing on /simple_node/chatter" false
+        fi
+    fi
+
+    # Stop the service
+    systemctl --user stop "${SERVICE_UNIT}.service"
+
+    # Wait up to 5 s for the service to become inactive
+    DEADLINE=$((SECONDS + 5))
+    STOPPED=false
+    while [[ $SECONDS -lt $DEADLINE ]]; do
+        STATE=$(systemctl --user is-active "${SERVICE_UNIT}" 2>/dev/null || true)
+        if [[ "$STATE" != "active" ]]; then
+            STOPPED=true
+            break
+        fi
+        sleep 0.2
+    done
+
+    check "service stopped cleanly (systemctl --user stop)" $STOPPED
+
+    if $STOPPED; then
+        # Verify the ROS 2 node is no longer on the graph
+        NODE_GONE=false
+        DEADLINE=$((SECONDS + 10))
+        while [[ $SECONDS -lt $DEADLINE ]]; do
+            if ! "$ROS2_BIN" node list 2>/dev/null | grep -q "/simple_node"; then
+                NODE_GONE=true
+                break
+            fi
+            sleep 0.5
+        done
+
+        check "ROS 2 node /simple_node is no longer on the graph" $NODE_GONE
+    fi
 fi
-
-# Clear DAEMON_PID so cleanup doesn't try to kill again
-unset DAEMON_PID
 
 echo ""
 
