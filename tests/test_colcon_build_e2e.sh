@@ -69,8 +69,10 @@ echo "  Workspace ready."
 # ---------------------------------------------------------------
 echo "[2/6] Running colcon build..."
 cd "$WORKSPACE"
+set +e
 BUILD_OUTPUT=$(colcon build 2>&1)
 BUILD_RC=$?
+set -e
 
 check "colcon build exits with rc=0" test "$BUILD_RC" -eq 0
 
