@@ -11,30 +11,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.10", "3.11", "3.12"]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[test]"
-          pip install colcon-python-setup-py colcon-bash colcon-recursive-crawl
-
-      - name: Run tests
-        run: |
-          pytest tests/ -v --tb=short
-
-  ros-e2e:
-    name: ROS 2 end-to-end tests (Jazzy)
+    name: Tests (ros:jazzy)
     runs-on: ubuntu-latest
     container:
       image: ros:jazzy
@@ -49,7 +26,7 @@ jobs:
           python3 -m pip install --break-system-packages \
             colcon-python-setup-py colcon-bash colcon-recursive-crawl
 
-      - name: Run all tests (ROS 2 tests auto-enabled by the environment)
+      - name: Run tests
         run: |
           . /opt/ros/jazzy/setup.sh
           pytest tests/ -v --tb=short

@@ -72,11 +72,6 @@ def _get_ros_env(ros_setup_bash: Path) -> dict:
     return env
 
 
-def _ros2_available() -> bool:
-    """Return ``True`` when a ROS 2 installation is detectable on this host."""
-    return _find_ros_setup_bash() is not None
-
-
 def _make_job_ended(identifier: str, rc: int):
     """Create a real JobEnded event."""
     from colcon_core.event.job import JobEnded
@@ -896,10 +891,6 @@ class TestEndToEnd:
             f"stderr was swallowed: {result.stderr!r}"
         )
 
-    @pytest.mark.skipif(
-        not _ros2_available(),
-        reason="ROS 2 not installed (no /opt/ros/<distro>/setup.bash)",
-    )
     def test_ros2_node_pubsub_via_wrapper(self, tmp_path: Path) -> None:
         """
         Verify that a real ROS 2 publisher node, started via the generated
