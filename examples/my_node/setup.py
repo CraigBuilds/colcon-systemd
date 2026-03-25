@@ -7,14 +7,15 @@ setup(
     version='0.1.0',
     packages=find_packages(),
     data_files=[
-        # Creates share/my_node/ in the install tree (required by colcon)
-        ('share/' + package_name, []),
+        ('share/ament_index/resource_index/packages',
+            ['resource/' + package_name]),
+        ('share/' + package_name, ['package.xml']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='example',
     maintainer_email='example@example.com',
-    description='Example package for colcon-systemd',
+    description='Example minimal ROS 2 publisher node managed by colcon-systemd',
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
