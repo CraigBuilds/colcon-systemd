@@ -172,7 +172,7 @@ bash **wrapper script** that sources the workspace `setup.bash` and then
 #!/usr/bin/env bash
 set -eo pipefail
 source "/path/to/install/setup.bash"
-exec "/path/to/install/lib/my_pkg/my_node" "$@"
+exec "/path/to/install/my_pkg/lib/my_pkg/my_node" "$@"
 ```
 
 The systemd unit's `ExecStart` calls this wrapper, so systemd tracks the real
