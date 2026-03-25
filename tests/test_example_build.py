@@ -7,6 +7,8 @@ This calls tests/test_example_build.sh which:
   1. Creates a temp colcon workspace with examples/my_node
   2. Runs `colcon build`
   3. Verifies that .service and .sh files were generated
+  4. If ROS 2 is available: starts the node via the wrapper and verifies
+     that it publishes ROS 2 messages on /my_node/chatter
 """
 
 import platform
@@ -29,7 +31,7 @@ def test_example_build() -> None:
         ["bash", str(script)],
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=180,
     )
 
     if result.stdout:

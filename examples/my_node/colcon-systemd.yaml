@@ -1,5 +1,5 @@
 services:
   - name: my_node
     entry_point: my_node
-    description: "Example node managed by colcon-systemd"
+    description: "Example minimal ROS 2 publisher node managed by colcon-systemd"
     restart: on-failure
