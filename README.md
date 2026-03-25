@@ -5,11 +5,20 @@ Colcon plugin that generates systemd service units for opted-in packages during
 
 ## Installation
 
+### From PyPI (once published)
+
+Install into your current Python environment (the same one where `colcon` is
+installed):
+
 ```bash
 pip install colcon-systemd
 ```
 
-Or for development:
+This installs the plugin into your user or virtualenv site-packages — it does
+**not** install anything system-wide or require root.  colcon discovers the
+plugin automatically via entry points.
+
+### From Source (development)
 
 ```bash
 git clone https://github.com/CraigBuilds/colcon-systemd.git
@@ -17,9 +26,25 @@ cd colcon-systemd
 pip install -e ".[test]"
 ```
 
+The `-e` (editable) flag means changes you make to the source take effect
+immediately without reinstalling.  Run this from the cloned `colcon-systemd/`
+directory.
+
+### Verifying the Installation
+
+After installing, confirm colcon can see the plugin:
+
+```bash
+colcon build --event-handlers systemd+
+# You should not get "unknown event handler" errors
+```
+
 ## Quick Start
 
-1. Add a `colcon-systemd.yaml` to your package source root:
+### 1. Add a Config File to Your Package
+
+In the source root of a ROS 2 / colcon package (next to `package.xml`), create
+a `colcon-systemd.yaml`:
 
 ```yaml
 services:
@@ -31,20 +56,34 @@ services:
     restart: on-failure
 ```
 
-2. Build with colcon:
+### 2. Build from Your Workspace Root
+
+Run `colcon build` from the **workspace root** (the directory that contains
+`src/`, or wherever your packages live — the same place you'd normally run
+`colcon build`):
 
 ```bash
+cd ~/my_ros2_ws    # your colcon workspace root
 colcon build
 ```
 
-3. Find the generated files in the install tree:
+The plugin runs automatically for any package that contains a
+`colcon-systemd.yaml` file.  Packages without the file are unaffected.
+
+### 3. Find the Generated Files
+
+The generated service files are written into the colcon **install tree** — they
+are never written to `/etc/systemd/system` or any system directory:
 
 ```
-install/<pkg>/share/colcon-systemd/my_node.service
-install/<pkg>/share/colcon-systemd/my_node.sh
+install/<pkg>/share/colcon-systemd/my_node.service   # systemd unit
+install/<pkg>/share/colcon-systemd/my_node.sh         # wrapper script
 ```
 
-4. Install the user service:
+### 4. Activate the Service (Optional)
+
+To actually run the service with systemd, symlink the unit into your user
+systemd directory:
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -54,6 +93,8 @@ systemctl --user daemon-reload
 systemctl --user start my_node
 systemctl --user status my_node
 ```
+
+This uses `systemctl --user`, which does not require root.
 
 ## Configuration Reference
 
