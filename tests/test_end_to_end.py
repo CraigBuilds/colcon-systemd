@@ -10,7 +10,6 @@ units and wrapper scripts are valid and actually work at runtime.
 
 import os
 import platform
-import socket
 import stat
 import subprocess
 import textwrap
@@ -28,6 +27,54 @@ pytestmark = pytest.mark.skipif(
     platform.system() != "Linux",
     reason="End-to-end tests require Linux",
 )
+
+
+def _find_ros_setup_bash() -> "Path | None":
+    """Return the path to the first available ROS 2 distro setup.bash.
+
+    Scans ``/opt/ros/`` for distro directories and returns the setup.bash
+    of the first one found (alphabetically), or ``None`` if ROS 2 is not
+    installed.
+    """
+    opt_ros = Path("/opt/ros")
+    if not opt_ros.is_dir():
+        return None
+    for distro_dir in sorted(opt_ros.iterdir()):
+        setup = distro_dir / "setup.bash"
+        if setup.exists():
+            return setup
+    return None
+
+
+def _get_ros_env(ros_setup_bash: Path) -> dict:
+    """Return the shell environment that results from sourcing *ros_setup_bash*.
+
+    Runs ``bash -c 'source <setup.bash> && env'`` and parses the output into
+    a dictionary so that subprocesses can be given the full ROS environment
+    without needing a shell wrapper.
+    """
+    result = subprocess.run(
+        ["bash", "-c", f"source {ros_setup_bash} && env"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to source ROS setup.bash ({ros_setup_bash}):\n"
+            f"{result.stderr}"
+        )
+    env: dict = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            key, _, val = line.partition("=")
+            env[key] = val
+    return env
+
+
+def _ros2_available() -> bool:
+    """Return ``True`` when a ROS 2 installation is detectable on this host."""
+    return _find_ros_setup_bash() is not None
 
 
 def _make_job_ended(identifier: str, rc: int):
@@ -493,7 +540,6 @@ class TestEndToEnd:
         )
         assert result.returncode == 0
 
-
     def test_wrapper_propagates_exit_code(self, tmp_path: Path) -> None:
         """
         Verify that the wrapper script propagates the node's exit code.
@@ -850,32 +896,40 @@ class TestEndToEnd:
             f"stderr was swallowed: {result.stderr!r}"
         )
 
-    def test_node_pubsub_functionality(self, tmp_path: Path) -> None:
+    @pytest.mark.skipif(
+        not _ros2_available(),
+        reason="ROS 2 not installed (no /opt/ros/<distro>/setup.bash)",
+    )
+    def test_ros2_node_pubsub_via_wrapper(self, tmp_path: Path) -> None:
         """
-        Verify that the node's event loop spins and its pub/sub logic works
-        when run via the generated wrapper script.
+        Verify that a real ROS 2 publisher node, started via the generated
+        wrapper script, publishes messages over DDS that a subscriber receives.
 
-        Earlier tests only checked that a process starts.  A false positive
-        is possible when a service starts but the node's internal logic stalls
-        or crashes silently — a situation that previous tests would miss.
+        This is the critical end-to-end test — it proves that wrapping a ROS 2
+        node as a systemd service does not break its DDS middleware
+        communication.  A false positive is impossible: if the wrapper broke
+        DDS discovery, RMW transport, or the ROS executor, ``ros2 topic echo``
+        would receive nothing and the assertion would fail.
 
-        This test uses a Unix-domain socket as a real IPC channel to simulate
-        ROS 2 publisher/subscriber communication:
-
-          - **Publisher (node)**: binds a Unix socket, waits for a subscriber,
-            then emits sequentially-numbered ``MSG:<n>`` messages at 0.1 s
-            intervals — simulating a ROS 2 node whose executor is spinning and
-            whose publisher callback fires on a timer.
-
-          - **Subscriber (this test)**: connects to the socket and reads
-            messages — simulating a ROS 2 subscriber receiving published data.
-
-        Because the subscriber must receive N sequential messages over real
-        clock time, there is no way to get a false positive: if the node's
-        event loop stalls, the connection drops and the assertion fails.
+        Test flow
+        ---------
+        1. Create a colcon install tree whose ``setup.bash`` sources the real
+           ROS environment, simulating a colcon workspace that depends on ROS.
+        2. Write a real ``rclpy`` publisher as the package entry point; it
+           publishes ``std_msgs/String`` to a unique topic and prints
+           ``PUBLISHER_READY`` on stdout once its executor is spinning.
+        3. Generate the wrapper script with ``SystemdEventHandler`` — the same
+           path taken by ``colcon build`` in production.
+        4. Start the wrapper as a subprocess (the "systemd starts the service"
+           step).
+        5. Run ``ros2 topic echo --once`` as the subscriber and assert that at
+           least one well-formed message arrives from the publisher.
         """
-        pkg_name = "e2e_pubsub_pkg"
-        svc_name = "e2e_publisher_node"
+        ros_setup = _find_ros_setup_bash()
+        assert ros_setup is not None  # satisfied by the skipif guard above
+
+        pkg_name = "e2e_ros_pub_pkg"
+        svc_name = "e2e_ros_publisher"
         install_root = tmp_path / "install"
         install_root.mkdir()
         install_base = install_root / pkg_name
@@ -883,26 +937,45 @@ class TestEndToEnd:
         pkg_path = tmp_path / "src" / pkg_name
         pkg_path.mkdir(parents=True)
 
-        socket_path = str(tmp_path / "pubsub.sock")
+        # Use a unique topic name derived from tmp_path to avoid collisions
+        # when multiple test runs execute in parallel.
+        topic = f"/colcon_systemd_e2e_{tmp_path.name}"
+
+        # Create a workspace-level setup.bash that sources the real ROS
+        # environment.  The generated wrapper does:
+        #   source <install_base>/../setup.bash
+        # which resolves to install_root/setup.bash here.
+        ros_setup_bash = install_root / "setup.bash"
+        ros_setup_bash.write_text(
+            "#!/usr/bin/env bash\n"
+            f"source {ros_setup}\n"
+            'export COLCON_SYSTEMD_E2E_SOURCED="1"\n'
+        )
+        ros_setup_bash.chmod(0o755)
 
         (pkg_path / "colcon-systemd.yaml").write_text(
             textwrap.dedent(f"""\
                 services:
                   - name: {svc_name}
                     entry_point: {svc_name}
-                    description: "Pub/sub functionality test node"
+                    description: "ROS 2 publisher node under test"
             """)
         )
 
-        # Publisher node: Python3 script that binds a Unix socket and sends
-        # 10 sequentially-numbered messages to the first subscriber that
-        # connects.  This simulates a ROS 2 node whose executor is spinning
-        # and whose timer callback publishes at a fixed rate.
+        # Real rclpy publisher: publishes String messages on the given topic.
+        # PUBLISHER_READY is printed once the node is spinning so the test
+        # knows when to start the subscriber.
         publisher_script = textwrap.dedent("""\
             #!/usr/bin/env python3
-            import socket, sys, time, signal, os
+            \"\"\"Real ROS 2 publisher node used by the colcon-systemd e2e test.\"\"\"
+            import sys
+            import signal
+            import time
+            import rclpy
+            from rclpy.node import Node
+            from std_msgs.msg import String
 
-            SOCKET_PATH = sys.argv[1]
+            TOPIC = sys.argv[1]
 
             running = True
 
@@ -913,39 +986,25 @@ class TestEndToEnd:
             signal.signal(signal.SIGTERM, _stop)
             signal.signal(signal.SIGINT, _stop)
 
-            if os.path.exists(SOCKET_PATH):
-                os.unlink(SOCKET_PATH)
-
-            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            server.bind(SOCKET_PATH)
-            server.listen(1)
-            server.settimeout(10)
+            rclpy.init()
+            node = Node("e2e_ros_publisher")
+            pub = node.create_publisher(String, TOPIC, 10)
 
             print("PUBLISHER_READY", flush=True)
 
-            try:
-                conn, _ = server.accept()
-            except socket.timeout:
-                print("PUBLISHER_TIMEOUT: no subscriber connected", flush=True)
-                sys.exit(1)
-
             seq = 0
-            while running and seq < 10:
-                try:
-                    conn.sendall("MSG:{}\\n".format(seq).encode())
-                except BrokenPipeError:
-                    break
+            while running:
+                msg = String()
+                msg.data = f"hello_{seq}"
+                pub.publish(msg)
                 seq += 1
                 time.sleep(0.1)
 
-            conn.close()
-            server.close()
-            if os.path.exists(SOCKET_PATH):
-                os.unlink(SOCKET_PATH)
-
-            print("PUBLISHER_DONE", flush=True)
+            node.destroy_node()
         """)
 
+        # _setup_install_tree skips creating setup.bash if it already exists,
+        # so the ROS-aware version created above is preserved.
         _setup_install_tree(
             install_root, pkg_name, svc_name, script_body=publisher_script
         )
@@ -956,74 +1015,73 @@ class TestEndToEnd:
         wrapper = install_base / "share" / "colcon-systemd" / f"{svc_name}.sh"
         assert wrapper.exists()
 
-        # Start the publisher node via the wrapper, passing the socket path
-        # as a runtime argument — simulating systemd starting the service.
-        proc = subprocess.Popen(
-            [str(wrapper), socket_path],
+        # Start the publisher node via the generated wrapper.
+        pub_proc = subprocess.Popen(
+            [str(wrapper), topic],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
 
-        subscriber = None
-        received = []
+        received_msg = None
+        sub_result = None
         try:
-            # Wait for the publisher to create the socket (node is ready)
-            deadline = time.monotonic() + 10
+            # Wait for the node to signal its executor is spinning.
+            deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
-                if os.path.exists(socket_path):
+                line = pub_proc.stdout.readline()
+                if "PUBLISHER_READY" in line:
                     break
-                time.sleep(0.05)
             else:
                 stdout, stderr = "", ""
                 try:
-                    stdout, stderr = proc.communicate(timeout=2)
+                    stdout, stderr = pub_proc.communicate(timeout=2)
                 except subprocess.TimeoutExpired:
                     pass
                 pytest.fail(
-                    "Publisher socket never appeared — node did not start.\n"
+                    "Publisher never printed PUBLISHER_READY — node did not start.\n"
                     f"stdout={stdout!r}\nstderr={stderr!r}"
                 )
 
-            # Connect as subscriber (simulates a ROS 2 subscriber)
-            subscriber = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            subscriber.connect(socket_path)
-            subscriber.settimeout(10)
+            # Allow DDS discovery time to propagate before subscribing.
+            time.sleep(0.5)
 
-            # Receive messages until the publisher closes the connection
-            buf = ""
-            while True:
-                try:
-                    chunk = subscriber.recv(256).decode()
-                    if not chunk:
-                        break
-                    buf += chunk
-                    while "\n" in buf:
-                        line, buf = buf.split("\n", 1)
-                        if line.startswith("MSG:"):
-                            received.append(int(line.split(":")[1]))
-                except socket.timeout:
-                    break
+            ros_env = _get_ros_env(ros_setup)
+            ros2_bin = str(ros_setup.parent / "bin" / "ros2")
+
+            # Run ros2 topic echo as the subscriber.  --once exits after the
+            # first message, giving a clear pass/fail signal.
+            sub_result = subprocess.run(
+                [ros2_bin, "topic", "echo", topic, "std_msgs/msg/String", "--once"],
+                env=ros_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+            if sub_result.returncode == 0 and sub_result.stdout.strip():
+                received_msg = sub_result.stdout.strip()
 
         finally:
-            if subscriber is not None:
-                subscriber.close()
-            proc.terminate()
+            pub_proc.terminate()
             try:
-                proc.wait(timeout=5)
+                pub_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+                pub_proc.kill()
+                pub_proc.wait()
 
-        # Verify the event loop ran and produced sequential, in-order messages.
-        # Out-of-order or missing sequence numbers would indicate the executor
-        # loop stalled or dropped callbacks — the same failure mode that would
-        # break a real ROS 2 node.
-        assert len(received) >= 5, (
-            f"Node event loop did not produce enough messages: received={received}"
+        assert received_msg is not None, (
+            "ros2 topic echo received no message from the ROS 2 publisher node.\n"
+            + (
+                f"Subscriber stdout={sub_result.stdout!r}\n"
+                f"Subscriber stderr={sub_result.stderr!r}\n"
+                f"Subscriber rc={sub_result.returncode}"
+                if sub_result is not None
+                else "(subscriber was never started)"
+            )
         )
-        assert received == list(range(len(received))), (
-            f"Messages arrived out-of-order or with gaps: {received}"
+        assert "data: hello_" in received_msg, (
+            f"Unexpected message content received: {received_msg!r}"
         )
 
 
