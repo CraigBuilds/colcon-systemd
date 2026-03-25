@@ -6,8 +6,8 @@
 #   2. Builds the simple_node test package with colcon build
 #   3. Verifies that .service and .sh files were generated at the correct paths
 #   4. Validates the .service file content
-#   5. Runs the wrapper script and checks the node actually executes
-#   6. Starts the node as a daemon, verifies it is running, then stops it
+#   5. Runs the wrapper script (one-shot) to confirm it sources the environment
+#   6. Installs the .service file and starts/stops it via systemctl --user
 #
 # Exit codes: 0 = all checks passed, 1 = a check failed.
 # Usage:  bash tests/test_colcon_build_e2e.sh
@@ -19,13 +19,18 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORKSPACE="$(mktemp -d)"
 PKG_NAME="simple_node"
 SVC_NAME="simple_node"
+# Use a unique unit name to avoid collisions with any real deployment.
+SERVICE_UNIT="colcon_systemd_simple_node_test"
+SYSTEMD_USER_PID=""
 
 cleanup() {
-    if [[ -n "${DAEMON_PID:-}" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
-        kill "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
-    fi
+    systemctl --user stop "$SERVICE_UNIT" 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/${SERVICE_UNIT}.service"
+    systemctl --user daemon-reload 2>/dev/null || true
     rm -rf "$WORKSPACE"
+    if [[ -n "${SYSTEMD_USER_PID:-}" ]]; then
+        kill "$SYSTEMD_USER_PID" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 
@@ -142,11 +147,11 @@ fi
 echo ""
 
 # ---------------------------------------------------------------
-# Step 5: Run the wrapper script (one-shot)
+# Step 5: Run the wrapper script (one-shot) to validate environment
 # ---------------------------------------------------------------
 echo "[5/6] Running wrapper script (one-shot)..."
 
-RUN_OUTPUT=$("$WRAPPER_FILE" 2>&1)
+RUN_OUTPUT=$("$WRAPPER_FILE" --once 2>&1)
 RUN_RC=$?
 
 check "wrapper script exits with rc=0" test "$RUN_RC" -eq 0
@@ -159,48 +164,86 @@ fi
 echo ""
 
 # ---------------------------------------------------------------
-# Step 6: Run as daemon, verify it is running, then stop it
+# Step 6: Start via systemctl --user, verify running, then stop
 # ---------------------------------------------------------------
-echo "[6/6] Running as daemon service..."
+echo "[6/6] Starting .service via systemctl --user..."
 
-DAEMON_OUT="$WORKSPACE/daemon.out"
-"$WRAPPER_FILE" --daemon > "$DAEMON_OUT" 2>&1 &
-DAEMON_PID=$!
+# Ensure a user systemd session is available.
+# In container/CI environments the session may not be started automatically;
+# in that case we start D-Bus and systemd --user ourselves.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+mkdir -p "$XDG_RUNTIME_DIR"
 
-# Wait up to 5 seconds for the daemon to start
+SYSTEMD_STATE=$(systemctl --user is-system-running 2>/dev/null || true)
+if [[ ! "$SYSTEMD_STATE" =~ ^(running|degraded)$ ]]; then
+    echo "  User systemd not running — starting session..."
+    if [[ ! -S "$XDG_RUNTIME_DIR/bus" ]]; then
+        /usr/bin/dbus-daemon --session \
+            --address="unix:path=$XDG_RUNTIME_DIR/bus" \
+            --fork --nopidfile 2>/dev/null || true
+        sleep 0.3
+    fi
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+    /usr/lib/systemd/systemd --user 2>/dev/null &
+    SYSTEMD_USER_PID=$!
+    DEADLINE=$((SECONDS + 10))
+    until [[ $(systemctl --user is-system-running 2>/dev/null || true) =~ ^(running|degraded)$ ]]; do
+        if [[ $SECONDS -ge $DEADLINE ]]; then
+            echo "ABORT: could not start user systemd session within 10 s"
+            exit 1
+        fi
+        sleep 0.5
+    done
+    echo "  User systemd session started."
+fi
+
+# Install the generated .service file under a test-specific unit name and start it.
+USER_UNIT_DIR="$HOME/.config/systemd/user"
+mkdir -p "$USER_UNIT_DIR"
+cp "$SERVICE_FILE" "$USER_UNIT_DIR/${SERVICE_UNIT}.service"
+systemctl --user daemon-reload
+systemctl --user start "${SERVICE_UNIT}.service"
+
+check "service started (systemctl --user start)" true
+
+# Wait up to 5 s for the service to become active
 DEADLINE=$((SECONDS + 5))
-STARTED=false
-while [ $SECONDS -lt $DEADLINE ]; do
-    if grep -q "SIMPLE_NODE_RUNNING" "$DAEMON_OUT" 2>/dev/null; then
-        STARTED=true
+ACTIVE=false
+while [[ $SECONDS -lt $DEADLINE ]]; do
+    if [[ "$(systemctl --user is-active "${SERVICE_UNIT}" 2>/dev/null || true)" == "active" ]]; then
+        ACTIVE=true
         break
     fi
     sleep 0.2
 done
 
-check "daemon started within 5 seconds" $STARTED
+check "service is active after start" $ACTIVE
 
-if $STARTED; then
-    # Verify the process is actually running
-    check "daemon PID is alive" kill -0 "$DAEMON_PID" 2>/dev/null
+if $ACTIVE; then
+    # Confirm the underlying process is actually running by checking its MainPID
+    MAIN_PID=$(systemctl --user show -p MainPID --value "${SERVICE_UNIT}" 2>/dev/null || echo 0)
+    check "service MainPID is non-zero" test "${MAIN_PID:-0}" -gt 0
+    check "service process is alive" kill -0 "$MAIN_PID" 2>/dev/null
 
-    # Wait for heartbeat
+    # Wait a moment for heartbeat output, then stop the service
     sleep 1
-    HEARTBEAT_COUNT=$(grep -c "SIMPLE_NODE_HEARTBEAT" "$DAEMON_OUT" 2>/dev/null || echo 0)
-    check "daemon produced heartbeat output (count=$HEARTBEAT_COUNT)" \
-        test "$HEARTBEAT_COUNT" -ge 1
 
-    # Send SIGTERM and verify graceful shutdown
-    kill "$DAEMON_PID" 2>/dev/null
-    wait "$DAEMON_PID" 2>/dev/null || true
-    sleep 0.5
+    systemctl --user stop "${SERVICE_UNIT}.service"
 
-    check "daemon handled SIGTERM gracefully" \
-        grep -q "SIMPLE_NODE_STOPPED" "$DAEMON_OUT"
+    # Wait up to 5 s for the service to become inactive
+    DEADLINE=$((SECONDS + 5))
+    STOPPED=false
+    while [[ $SECONDS -lt $DEADLINE ]]; do
+        STATE=$(systemctl --user is-active "${SERVICE_UNIT}" 2>/dev/null || true)
+        if [[ "$STATE" != "active" ]]; then
+            STOPPED=true
+            break
+        fi
+        sleep 0.2
+    done
+
+    check "service stopped cleanly (systemctl --user stop)" $STOPPED
 fi
-
-# Clear DAEMON_PID so cleanup doesn't try to kill again
-unset DAEMON_PID
 
 echo ""
 

@@ -7,8 +7,9 @@ This calls tests/test_colcon_build_e2e.sh which:
   1. Creates a temp colcon workspace with test_packages/simple_node
   2. Runs `colcon build`
   3. Verifies generated .service and .sh files
-  4. Runs the wrapper script (one-shot)
-  5. Starts the node as a daemon and confirms it is running
+  4. Validates .service file content
+  5. Runs the wrapper script (one-shot) to confirm environment sourcing works
+  6. Installs the .service and starts/stops it via systemctl --user
 """
 
 import platform
