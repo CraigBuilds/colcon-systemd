@@ -101,6 +101,41 @@ class TestParseConfigValid:
         assert svc.restart == "always"
         assert svc.working_directory == "/home/ros"
 
+    def test_args_as_list(self, tmp_path: Path) -> None:
+        cfg = self._write_config(tmp_path, """\
+            services:
+              - name: my_node
+                entry_point: my_node
+                args:
+                  - "--arg1"
+                  - "val1"
+                  - "--arg2"
+                  - "val2"
+        """)
+        result = parse_config(cfg)
+        svc = result.services[0]
+        assert svc.args == ["--arg1", "val1", "--arg2", "val2"]
+
+    def test_args_as_string(self, tmp_path: Path) -> None:
+        cfg = self._write_config(tmp_path, """\
+            services:
+              - name: my_node
+                entry_point: my_node
+                args: "--arg1 val1 --arg2 val2"
+        """)
+        result = parse_config(cfg)
+        svc = result.services[0]
+        assert svc.args == ["--arg1", "val1", "--arg2", "val2"]
+
+    def test_args_defaults_to_empty_list(self, tmp_path: Path) -> None:
+        cfg = self._write_config(tmp_path, """\
+            services:
+              - name: my_node
+                entry_point: my_node
+        """)
+        result = parse_config(cfg)
+        assert result.services[0].args == []
+
     def test_multiple_services(self, tmp_path: Path) -> None:
         cfg = self._write_config(tmp_path, """\
             services:
@@ -238,4 +273,14 @@ class TestParseConfigErrors:
     def test_empty_services_list(self, tmp_path: Path) -> None:
         cfg = self._write_config(tmp_path, "services: []\n")
         with pytest.raises(ConfigError, match="'services' key is required"):
+            parse_config(cfg)
+
+    def test_args_invalid_type(self, tmp_path: Path) -> None:
+        cfg = self._write_config(tmp_path, """\
+            services:
+              - name: test
+                entry_point: test
+                args: 42
+        """)
+        with pytest.raises(ConfigError, match="'args' must be a list of strings"):
             parse_config(cfg)

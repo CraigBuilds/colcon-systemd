@@ -26,6 +26,7 @@ class ServiceConfig:
         environment: Optional[Dict[str, str]] = None,
         restart: str = "on-failure",
         working_directory: Optional[str] = None,
+        args: Optional[List[str]] = None,
     ) -> None:
         self.name = name
         self.entry_point = entry_point
@@ -35,6 +36,7 @@ class ServiceConfig:
         self.environment = environment or {}
         self.restart = restart
         self.working_directory = working_directory
+        self.args = args or []
 
     def __repr__(self) -> str:
         return f"ServiceConfig(name={self.name!r})"
@@ -148,6 +150,18 @@ def _validate_service(service_dict: Any, index: int) -> ServiceConfig:
             f"Service '{name}': 'working_directory' must be a string"
         )
 
+    args_raw = service_dict.get("args")
+    if args_raw is not None:
+        if isinstance(args_raw, str):
+            # Accept a plain string and split it into a list
+            args_raw = args_raw.split()
+        elif not isinstance(args_raw, list) or not all(
+            isinstance(a, str) for a in args_raw
+        ):
+            raise ConfigError(
+                f"Service '{name}': 'args' must be a list of strings or a single string"
+            )
+
     return ServiceConfig(
         name=name,
         entry_point=entry_point,
@@ -157,6 +171,7 @@ def _validate_service(service_dict: Any, index: int) -> ServiceConfig:
         environment={k: str(v) for k, v in (environment or {}).items()},
         restart=restart,
         working_directory=working_directory,
+        args=args_raw or [],
     )
 
 
