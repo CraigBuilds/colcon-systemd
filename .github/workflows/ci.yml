@@ -33,6 +33,27 @@ jobs:
         run: |
           pytest tests/ -v --tb=short
 
+  ros-e2e:
+    name: ROS 2 end-to-end tests (Jazzy)
+    runs-on: ubuntu-latest
+    container:
+      image: ros:jazzy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python test dependencies
+        run: |
+          apt-get update -q
+          apt-get install -y -q python3-pip python3-numpy
+          python3 -m pip install --break-system-packages -e ".[test]"
+          python3 -m pip install --break-system-packages \
+            colcon-python-setup-py colcon-bash colcon-recursive-crawl
+
+      - name: Run all tests (ROS 2 tests auto-enabled by the environment)
+        run: |
+          . /opt/ros/jazzy/setup.sh
+          pytest tests/ -v --tb=short
+
   lint:
     runs-on: ubuntu-latest
     steps:

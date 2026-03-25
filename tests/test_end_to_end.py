@@ -29,6 +29,54 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _find_ros_setup_bash() -> "Path | None":
+    """Return the path to the first available ROS 2 distro setup.bash.
+
+    Scans ``/opt/ros/`` for distro directories and returns the setup.bash
+    of the first one found (alphabetically), or ``None`` if ROS 2 is not
+    installed.
+    """
+    opt_ros = Path("/opt/ros")
+    if not opt_ros.is_dir():
+        return None
+    for distro_dir in sorted(opt_ros.iterdir()):
+        setup = distro_dir / "setup.bash"
+        if setup.exists():
+            return setup
+    return None
+
+
+def _get_ros_env(ros_setup_bash: Path) -> dict:
+    """Return the shell environment that results from sourcing *ros_setup_bash*.
+
+    Runs ``bash -c 'source <setup.bash> && env'`` and parses the output into
+    a dictionary so that subprocesses can be given the full ROS environment
+    without needing a shell wrapper.
+    """
+    result = subprocess.run(
+        ["bash", "-c", f"source {ros_setup_bash} && env"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to source ROS setup.bash ({ros_setup_bash}):\n"
+            f"{result.stderr}"
+        )
+    env: dict = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            key, _, val = line.partition("=")
+            env[key] = val
+    return env
+
+
+def _ros2_available() -> bool:
+    """Return ``True`` when a ROS 2 installation is detectable on this host."""
+    return _find_ros_setup_bash() is not None
+
+
 def _make_job_ended(identifier: str, rc: int):
     """Create a real JobEnded event."""
     from colcon_core.event.job import JobEnded
@@ -40,19 +88,21 @@ def _make_job(
     package_path: Path,
     install_base: Path,
     package_type: str = "ros.ament_python",
+    merge_install: bool = False,
 ):
     """
     Create a minimal mock Job object.
 
     ``install_base`` should be the per-package prefix, matching colcon's
     isolated install layout (e.g. ``<ws>/install/<pkg>``).
+    Set ``merge_install=True`` to simulate ``colcon build --merge-install``.
     """
     pkg = SimpleNamespace(
         path=package_path,
         type=package_type,
         name=identifier,
     )
-    args = SimpleNamespace(install_base=str(install_base), merge_install=False)
+    args = SimpleNamespace(install_base=str(install_base), merge_install=merge_install)
     task_context = SimpleNamespace(pkg=pkg, args=args)
     return SimpleNamespace(task_context=task_context)
 
@@ -489,6 +539,550 @@ class TestEndToEnd:
             timeout=10,
         )
         assert result.returncode == 0
+
+    def test_wrapper_propagates_exit_code(self, tmp_path: Path) -> None:
+        """
+        Verify that the wrapper script propagates the node's exit code.
+
+        systemd uses the exit code to decide whether to restart a service
+        (via the Restart= policy).  If the wrapper masked a non-zero exit,
+        systemd would think the service succeeded and never restart it.
+        The wrapper uses ``exec`` which replaces the shell process, so the
+        node's exit code becomes the wrapper's exit code.
+        """
+        pkg_name = "e2e_exitcode_pkg"
+        svc_name = "e2e_failing_node"
+        install_root = tmp_path / "install"
+        install_root.mkdir()
+        install_base = install_root / pkg_name
+        install_base.mkdir()
+        pkg_path = tmp_path / "src" / pkg_name
+        pkg_path.mkdir(parents=True)
+
+        (pkg_path / "colcon-systemd.yaml").write_text(
+            textwrap.dedent(f"""\
+                services:
+                  - name: {svc_name}
+                    entry_point: {svc_name}
+                    description: "Exit code propagation test"
+                    restart: on-failure
+            """)
+        )
+
+        _setup_install_tree(
+            install_root, pkg_name, svc_name,
+            script_body=(
+                '#!/usr/bin/env bash\n'
+                'echo "NODE_STARTED"\n'
+                'exit 42\n'
+            ),
+        )
+
+        handler = SystemdEventHandler()
+        handler((_make_job_ended(pkg_name, rc=0), _make_job(pkg_name, pkg_path, install_base)))
+
+        wrapper = install_base / "share" / "colcon-systemd" / f"{svc_name}.sh"
+        assert wrapper.exists()
+
+        result = subprocess.run(
+            [str(wrapper)], capture_output=True, text=True, timeout=10
+        )
+
+        # The wrapper must not mask the node's exit code
+        assert result.returncode == 42, (
+            f"Expected exit code 42 but got {result.returncode}. "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        # The node did run before exiting
+        assert "NODE_STARTED" in result.stdout
+
+    def test_wrapper_forwards_runtime_args(self, tmp_path: Path) -> None:
+        """
+        Verify that arguments passed to the wrapper at runtime reach the node.
+
+        The wrapper uses ``exec "$executable" "$@"`` so any arguments given to
+        the wrapper process (e.g. by systemd from the ExecStart= line, or by
+        the operator directly) are forwarded verbatim to the node.
+        """
+        pkg_name = "e2e_fwdargs_pkg"
+        svc_name = "e2e_args_node"
+        install_root = tmp_path / "install"
+        install_root.mkdir()
+        install_base = install_root / pkg_name
+        install_base.mkdir()
+        pkg_path = tmp_path / "src" / pkg_name
+        pkg_path.mkdir(parents=True)
+
+        (pkg_path / "colcon-systemd.yaml").write_text(
+            textwrap.dedent(f"""\
+                services:
+                  - name: {svc_name}
+                    entry_point: {svc_name}
+                    description: "Args forwarding test"
+            """)
+        )
+
+        _setup_install_tree(
+            install_root, pkg_name, svc_name,
+            script_body=(
+                '#!/usr/bin/env bash\n'
+                'echo "ARGS: $*"\n'
+            ),
+        )
+
+        handler = SystemdEventHandler()
+        handler((_make_job_ended(pkg_name, rc=0), _make_job(pkg_name, pkg_path, install_base)))
+
+        wrapper = install_base / "share" / "colcon-systemd" / f"{svc_name}.sh"
+        assert wrapper.exists()
+
+        result = subprocess.run(
+            [str(wrapper), "--ros-args", "--param", "use_sim_time:=true"],
+            capture_output=True, text=True, timeout=10,
+        )
+
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert "--ros-args" in result.stdout
+        assert "--param" in result.stdout
+        assert "use_sim_time:=true" in result.stdout
+
+    def test_config_args_in_execstart_and_run(self, tmp_path: Path) -> None:
+        """
+        Verify that 'args' from the config appear in ExecStart and are passed
+        to the node when the wrapper is called with those arguments.
+
+        systemd reads ExecStart= and passes extra tokens to the wrapper.
+        Verifying ExecStart content plus a direct invocation with the same
+        args proves the full chain works end-to-end.
+        """
+        pkg_name = "e2e_cfgargs_pkg"
+        svc_name = "e2e_cfgargs_node"
+        install_root = tmp_path / "install"
+        install_root.mkdir()
+        install_base = install_root / pkg_name
+        install_base.mkdir()
+        pkg_path = tmp_path / "src" / pkg_name
+        pkg_path.mkdir(parents=True)
+
+        (pkg_path / "colcon-systemd.yaml").write_text(
+            textwrap.dedent(f"""\
+                services:
+                  - name: {svc_name}
+                    entry_point: {svc_name}
+                    description: "Config args test"
+                    args:
+                      - --ros-args
+                      - --param
+                      - use_sim_time:=true
+            """)
+        )
+
+        _setup_install_tree(
+            install_root, pkg_name, svc_name,
+            script_body=(
+                '#!/usr/bin/env bash\n'
+                'echo "ARGS: $*"\n'
+            ),
+        )
+
+        handler = SystemdEventHandler()
+        handler((_make_job_ended(pkg_name, rc=0), _make_job(pkg_name, pkg_path, install_base)))
+
+        wrapper = install_base / "share" / "colcon-systemd" / f"{svc_name}.sh"
+        service = install_base / "share" / "colcon-systemd" / f"{svc_name}.service"
+        assert wrapper.exists()
+        assert service.exists()
+
+        # Verify args appear in ExecStart
+        service_content = service.read_text()
+        assert "--ros-args" in service_content
+        assert "--param" in service_content
+        assert "use_sim_time:=true" in service_content
+
+        # Simulate systemd: pass the same args to the wrapper directly
+        result = subprocess.run(
+            [str(wrapper), "--ros-args", "--param", "use_sim_time:=true"],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert "--ros-args" in result.stdout
+        assert "use_sim_time:=true" in result.stdout
+
+    def test_merge_install_wrapper_runs(self, tmp_path: Path) -> None:
+        """
+        Verify that a wrapper generated in merge-install mode executes correctly.
+
+        In ``colcon build --merge-install``, all packages share a single install
+        prefix so setup.bash lives at ``<install_base>/setup.bash`` rather than
+        ``<install_base>/../setup.bash``.  The wrapper must source it from the
+        correct location.
+        """
+        pkg_name = "e2e_merge_pkg"
+        svc_name = "e2e_merge_node"
+        # In merge-install mode the install_base IS the workspace install root
+        install_base = tmp_path / "install"
+        install_base.mkdir()
+        pkg_path = tmp_path / "src" / pkg_name
+        pkg_path.mkdir(parents=True)
+
+        # setup.bash at the install root (no per-package sub-directory)
+        setup_bash = install_base / "setup.bash"
+        setup_bash.write_text(
+            '#!/usr/bin/env bash\n'
+            'export MERGE_INSTALL_SOURCED="1"\n'
+        )
+        setup_bash.chmod(0o755)
+
+        # Executable at install_base/lib/<pkg>/<ep>
+        ep_dir = install_base / "lib" / pkg_name
+        ep_dir.mkdir(parents=True)
+        ep = ep_dir / svc_name
+        ep.write_text(
+            '#!/usr/bin/env bash\n'
+            'echo "MERGE_INSTALL_SOURCED=${MERGE_INSTALL_SOURCED}"\n'
+            'echo "MERGE_NODE_RUNNING"\n'
+        )
+        ep.chmod(0o755)
+
+        (pkg_path / "colcon-systemd.yaml").write_text(
+            textwrap.dedent(f"""\
+                services:
+                  - name: {svc_name}
+                    entry_point: {svc_name}
+                    description: "Merge install test"
+            """)
+        )
+
+        handler = SystemdEventHandler()
+        job = _make_job(pkg_name, pkg_path, install_base, merge_install=True)
+        handler((_make_job_ended(pkg_name, rc=0), job))
+
+        wrapper = install_base / "share" / "colcon-systemd" / f"{svc_name}.sh"
+        assert wrapper.exists()
+
+        # The wrapper must reference the setup.bash inside install_base,
+        # not one level up
+        wrapper_content = wrapper.read_text()
+        assert str(install_base / "setup.bash") in wrapper_content
+
+        result = subprocess.run(
+            [str(wrapper)], capture_output=True, text=True, timeout=10
+        )
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert "MERGE_NODE_RUNNING" in result.stdout
+        assert "MERGE_INSTALL_SOURCED=1" in result.stdout
+
+    def test_two_packages_dont_interfere(self, tmp_path: Path) -> None:
+        """
+        Verify that two packages with the same service name are fully isolated.
+
+        colcon uses a separate install prefix per package in isolated mode.
+        Services from pkg_a and pkg_b must not overwrite each other's generated
+        files even when they share the same service name.
+        """
+        install_root = tmp_path / "install"
+        install_root.mkdir()
+        packages = [
+            ("pkg_a", "PKG_A_WORKER"),
+            ("pkg_b", "PKG_B_WORKER"),
+        ]
+
+        install_bases = {}
+        pkg_paths = {}
+        for pkg_name, marker in packages:
+            pkg_path = tmp_path / "src" / pkg_name
+            pkg_path.mkdir(parents=True)
+            install_base = install_root / pkg_name
+            install_base.mkdir()
+            pkg_paths[pkg_name] = pkg_path
+            install_bases[pkg_name] = install_base
+
+            (pkg_path / "colcon-systemd.yaml").write_text(
+                textwrap.dedent(f"""\
+                    services:
+                      - name: worker
+                        entry_point: worker
+                        description: "Worker for {pkg_name}"
+                """)
+            )
+            _setup_install_tree(
+                install_root, pkg_name, "worker",
+                script_body=(
+                    '#!/usr/bin/env bash\n'
+                    f'echo "{marker}"\n'
+                ),
+            )
+
+        # Fire the event handler for both packages
+        handler = SystemdEventHandler()
+        for pkg_name, _ in packages:
+            handler((
+                _make_job_ended(pkg_name, rc=0),
+                _make_job(pkg_name, pkg_paths[pkg_name], install_bases[pkg_name]),
+            ))
+
+        # Each package has its own set of generated files
+        wrapper_a = install_bases["pkg_a"] / "share" / "colcon-systemd" / "worker.sh"
+        wrapper_b = install_bases["pkg_b"] / "share" / "colcon-systemd" / "worker.sh"
+        assert wrapper_a.exists(), "pkg_a worker.sh not generated"
+        assert wrapper_b.exists(), "pkg_b worker.sh not generated"
+        # Files are distinct (different paths)
+        assert wrapper_a != wrapper_b
+
+        result_a = subprocess.run(
+            [str(wrapper_a)], capture_output=True, text=True, timeout=10
+        )
+        result_b = subprocess.run(
+            [str(wrapper_b)], capture_output=True, text=True, timeout=10
+        )
+        assert result_a.returncode == 0
+        assert result_b.returncode == 0
+
+        # Each wrapper produces only its own marker — no cross-contamination
+        assert "PKG_A_WORKER" in result_a.stdout
+        assert "PKG_B_WORKER" not in result_a.stdout
+        assert "PKG_B_WORKER" in result_b.stdout
+        assert "PKG_A_WORKER" not in result_b.stdout
+
+    def test_wrapper_stdout_stderr_passthrough(self, tmp_path: Path) -> None:
+        """
+        Verify the wrapper does not swallow node stdout or stderr.
+
+        systemd captures the service's stdout/stderr for journald.  If the
+        wrapper swallowed either stream, operators would lose diagnostic output
+        from their ROS 2 nodes (e.g. rosout, warnings, error traces).
+        """
+        pkg_name = "e2e_stdio_pkg"
+        svc_name = "e2e_stdio_node"
+        install_root = tmp_path / "install"
+        install_root.mkdir()
+        install_base = install_root / pkg_name
+        install_base.mkdir()
+        pkg_path = tmp_path / "src" / pkg_name
+        pkg_path.mkdir(parents=True)
+
+        (pkg_path / "colcon-systemd.yaml").write_text(
+            textwrap.dedent(f"""\
+                services:
+                  - name: {svc_name}
+                    entry_point: {svc_name}
+                    description: "Stdio passthrough test"
+            """)
+        )
+
+        _setup_install_tree(
+            install_root, pkg_name, svc_name,
+            script_body=(
+                '#!/usr/bin/env bash\n'
+                'echo "STDOUT_MESSAGE"\n'
+                'echo "STDERR_MESSAGE" >&2\n'
+            ),
+        )
+
+        handler = SystemdEventHandler()
+        handler((_make_job_ended(pkg_name, rc=0), _make_job(pkg_name, pkg_path, install_base)))
+
+        wrapper = install_base / "share" / "colcon-systemd" / f"{svc_name}.sh"
+        assert wrapper.exists()
+
+        result = subprocess.run(
+            [str(wrapper)], capture_output=True, text=True, timeout=10
+        )
+        assert result.returncode == 0
+        assert "STDOUT_MESSAGE" in result.stdout, (
+            f"stdout was swallowed: {result.stdout!r}"
+        )
+        assert "STDERR_MESSAGE" in result.stderr, (
+            f"stderr was swallowed: {result.stderr!r}"
+        )
+
+    @pytest.mark.skipif(
+        not _ros2_available(),
+        reason="ROS 2 not installed (no /opt/ros/<distro>/setup.bash)",
+    )
+    def test_ros2_node_pubsub_via_wrapper(self, tmp_path: Path) -> None:
+        """
+        Verify that a real ROS 2 publisher node, started via the generated
+        wrapper script, publishes messages over DDS that a subscriber receives.
+
+        This is the critical end-to-end test — it proves that wrapping a ROS 2
+        node as a systemd service does not break its DDS middleware
+        communication.  A false positive is impossible: if the wrapper broke
+        DDS discovery, RMW transport, or the ROS executor, ``ros2 topic echo``
+        would receive nothing and the assertion would fail.
+
+        Test flow
+        ---------
+        1. Create a colcon install tree whose ``setup.bash`` sources the real
+           ROS environment, simulating a colcon workspace that depends on ROS.
+        2. Write a real ``rclpy`` publisher as the package entry point; it
+           publishes ``std_msgs/String`` to a unique topic and prints
+           ``PUBLISHER_READY`` on stdout once its executor is spinning.
+        3. Generate the wrapper script with ``SystemdEventHandler`` — the same
+           path taken by ``colcon build`` in production.
+        4. Start the wrapper as a subprocess (the "systemd starts the service"
+           step).
+        5. Run ``ros2 topic echo --once`` as the subscriber and assert that at
+           least one well-formed message arrives from the publisher.
+        """
+        ros_setup = _find_ros_setup_bash()
+        assert ros_setup is not None  # satisfied by the skipif guard above
+
+        pkg_name = "e2e_ros_pub_pkg"
+        svc_name = "e2e_ros_publisher"
+        install_root = tmp_path / "install"
+        install_root.mkdir()
+        install_base = install_root / pkg_name
+        install_base.mkdir()
+        pkg_path = tmp_path / "src" / pkg_name
+        pkg_path.mkdir(parents=True)
+
+        # Use a unique topic name derived from tmp_path to avoid collisions
+        # when multiple test runs execute in parallel.
+        topic = f"/colcon_systemd_e2e_{tmp_path.name}"
+
+        # Create a workspace-level setup.bash that sources the real ROS
+        # environment.  The generated wrapper does:
+        #   source <install_base>/../setup.bash
+        # which resolves to install_root/setup.bash here.
+        ros_setup_bash = install_root / "setup.bash"
+        ros_setup_bash.write_text(
+            "#!/usr/bin/env bash\n"
+            f"source {ros_setup}\n"
+            'export COLCON_SYSTEMD_E2E_SOURCED="1"\n'
+        )
+        ros_setup_bash.chmod(0o755)
+
+        (pkg_path / "colcon-systemd.yaml").write_text(
+            textwrap.dedent(f"""\
+                services:
+                  - name: {svc_name}
+                    entry_point: {svc_name}
+                    description: "ROS 2 publisher node under test"
+            """)
+        )
+
+        # Real rclpy publisher: publishes String messages on the given topic.
+        # PUBLISHER_READY is printed once the node is spinning so the test
+        # knows when to start the subscriber.
+        publisher_script = textwrap.dedent("""\
+            #!/usr/bin/env python3
+            \"\"\"Real ROS 2 publisher node used by the colcon-systemd e2e test.\"\"\"
+            import sys
+            import signal
+            import time
+            import rclpy
+            from rclpy.node import Node
+            from std_msgs.msg import String
+
+            TOPIC = sys.argv[1]
+
+            running = True
+
+            def _stop(sig, frame):
+                global running
+                running = False
+
+            signal.signal(signal.SIGTERM, _stop)
+            signal.signal(signal.SIGINT, _stop)
+
+            rclpy.init()
+            node = Node("e2e_ros_publisher")
+            pub = node.create_publisher(String, TOPIC, 10)
+
+            print("PUBLISHER_READY", flush=True)
+
+            seq = 0
+            while running:
+                msg = String()
+                msg.data = f"hello_{seq}"
+                pub.publish(msg)
+                seq += 1
+                time.sleep(0.1)
+
+            node.destroy_node()
+        """)
+
+        # _setup_install_tree skips creating setup.bash if it already exists,
+        # so the ROS-aware version created above is preserved.
+        _setup_install_tree(
+            install_root, pkg_name, svc_name, script_body=publisher_script
+        )
+
+        handler = SystemdEventHandler()
+        handler((_make_job_ended(pkg_name, rc=0), _make_job(pkg_name, pkg_path, install_base)))
+
+        wrapper = install_base / "share" / "colcon-systemd" / f"{svc_name}.sh"
+        assert wrapper.exists()
+
+        # Start the publisher node via the generated wrapper.
+        pub_proc = subprocess.Popen(
+            [str(wrapper), topic],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        received_msg = None
+        sub_result = None
+        try:
+            # Wait for the node to signal its executor is spinning.
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                line = pub_proc.stdout.readline()
+                if "PUBLISHER_READY" in line:
+                    break
+            else:
+                stdout, stderr = "", ""
+                try:
+                    stdout, stderr = pub_proc.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+                pytest.fail(
+                    "Publisher never printed PUBLISHER_READY — node did not start.\n"
+                    f"stdout={stdout!r}\nstderr={stderr!r}"
+                )
+
+            # Allow DDS discovery time to propagate before subscribing.
+            time.sleep(0.5)
+
+            ros_env = _get_ros_env(ros_setup)
+            ros2_bin = str(ros_setup.parent / "bin" / "ros2")
+
+            # Run ros2 topic echo as the subscriber.  --once exits after the
+            # first message, giving a clear pass/fail signal.
+            sub_result = subprocess.run(
+                [ros2_bin, "topic", "echo", topic, "std_msgs/msg/String", "--once"],
+                env=ros_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+            if sub_result.returncode == 0 and sub_result.stdout.strip():
+                received_msg = sub_result.stdout.strip()
+
+        finally:
+            pub_proc.terminate()
+            try:
+                pub_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pub_proc.kill()
+                pub_proc.wait()
+
+        assert received_msg is not None, (
+            "ros2 topic echo received no message from the ROS 2 publisher node.\n"
+            + (
+                f"Subscriber stdout={sub_result.stdout!r}\n"
+                f"Subscriber stderr={sub_result.stderr!r}\n"
+                f"Subscriber rc={sub_result.returncode}"
+                if sub_result is not None
+                else "(subscriber was never started)"
+            )
+        )
+        assert "data: hello_" in received_msg, (
+            f"Unexpected message content received: {received_msg!r}"
+        )
 
 
 def _systemd_analyze_available() -> bool:
