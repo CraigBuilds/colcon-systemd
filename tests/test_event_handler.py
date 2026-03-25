@@ -263,11 +263,11 @@ class TestSystemdEventHandler:
         )
 
         import logging
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger="colcon_systemd.event_handler"):
             handler((event_data, job))
 
         # Files should still be generated
         output_dir = install_base / "share" / "colcon-systemd"
         assert (output_dir / "my_node.service").exists()
         # Warning should be logged
-        assert any("custom_type" in r.message for r in caplog.records)
+        assert any("custom_type" in m for m in caplog.messages)
