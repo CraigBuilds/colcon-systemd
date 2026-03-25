@@ -141,6 +141,22 @@ class TestRenderServiceUnit:
         )
         assert "Restart=always" in unit
 
+    def test_unit_with_args(self, install_base: Path) -> None:
+        svc = _make_service(args=["--arg1", "val1", "--arg2", "val2"])
+        wrapper_path = Path("/tmp/wrapper.sh")
+        unit = render_service_unit(
+            install_base, "my_pkg", svc, "ros.ament_python", wrapper_path
+        )
+        assert "ExecStart=/tmp/wrapper.sh --arg1 val1 --arg2 val2" in unit
+
+    def test_unit_without_args(self, install_base: Path) -> None:
+        svc = _make_service()
+        wrapper_path = Path("/tmp/wrapper.sh")
+        unit = render_service_unit(
+            install_base, "my_pkg", svc, "ros.ament_python", wrapper_path
+        )
+        assert "ExecStart=/tmp/wrapper.sh\n" in unit
+
 
 # ---------------------------------------------------------------------------
 # write_service_files

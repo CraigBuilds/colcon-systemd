@@ -137,6 +137,8 @@ def render_service_unit(
     description = service.description or f"{package_name} {service.name}"
     after = " ".join(service.after)
     exec_start = str(wrapper_script_path)
+    if service.args:
+        exec_start += " " + " ".join(service.args)
 
     env_lines = ""
     for key, value in service.environment.items():
