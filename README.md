@@ -5,13 +5,35 @@ Colcon plugin that generates systemd service units for opted-in packages during
 
 ## Installation
 
+### Prerequisites
+
+colcon-systemd requires a few companion colcon plugins to be installed in the
+same Python environment:
+
+| Package | Purpose |
+|---------|---------|
+| `colcon-bash` | Generates `setup.bash` in the install tree (sourced by the wrapper scripts) |
+| `colcon-python-setup-py` | Builds Python packages (`setup.py`/`setup.cfg`) |
+| `colcon-recursive-crawl` | Discovers packages in subdirectories (e.g. `src/<pkg>/`) |
+
+Install them all at once:
+
+```bash
+pip install colcon-bash colcon-python-setup-py colcon-recursive-crawl
+```
+
+> **Note:** Without `colcon-bash`, the `install/setup.bash` file is never
+> created and every generated wrapper script will fail at runtime.  Without
+> `colcon-recursive-crawl`, colcon will not find any packages inside your
+> `src/` directory.
+
 ### From PyPI (once published)
 
 Install into your current Python environment (the same one where `colcon` is
 installed):
 
 ```bash
-pip install colcon-systemd
+pip install colcon-systemd colcon-bash colcon-python-setup-py colcon-recursive-crawl
 ```
 
 This installs the plugin into your user or virtualenv site-packages — it does
@@ -24,6 +46,7 @@ plugin automatically via entry points.
 git clone https://github.com/CraigBuilds/colcon-systemd.git
 cd colcon-systemd
 pip install -e ".[test]"
+pip install colcon-bash colcon-python-setup-py colcon-recursive-crawl
 ```
 
 The `-e` (editable) flag means changes you make to the source take effect
@@ -35,8 +58,25 @@ directory.
 After installing, confirm colcon can see the plugin:
 
 ```bash
+# Check that the entry point is registered:
+python -c "
+import importlib.metadata, sys
+eps = list(importlib.metadata.entry_points(group='colcon_core.event_handler'))
+names = [ep.name for ep in eps]
+print('Registered event handlers:', names)
+if 'systemd' not in names:
+    print('ERROR: colcon-systemd is NOT registered!', file=sys.stderr)
+    sys.exit(1)
+print('colcon-systemd is registered correctly.')
+"
+```
+
+You can also do a quick sanity-check build in an empty directory:
+
+```bash
+mkdir /tmp/check_ws && cd /tmp/check_ws
 colcon build --event-handlers systemd+
-# You should not get "unknown event handler" errors
+# No "unknown event handler" error → plugin is registered
 ```
 
 ## Quick Start
@@ -69,6 +109,13 @@ colcon build
 
 The plugin runs automatically for any package that contains a
 `colcon-systemd.yaml` file.  Packages without the file are unaffected.
+
+`--symlink-install` is fully supported and does not affect how colcon-systemd
+locates entry points or generates service files:
+
+```bash
+colcon build --symlink-install
+```
 
 ### 3. Find the Generated Files
 
@@ -150,6 +197,46 @@ colcon build --event-handlers systemd-
 pip install -e ".[test]"
 pytest tests/ -v
 ```
+
+## Recommended Next Steps
+
+The following improvements would take this plugin from beta to production-ready:
+
+### Robustness
+- **Post-generation validation**: after writing the wrapper script, verify that
+  the target executable actually exists in the install tree and emit a clear
+  warning (not a silent failure) when it doesn't.
+- **Atomic writes**: write files to a `.tmp` path and rename atomically so that
+  a partial failure never leaves a half-written service unit on disk.
+- **`colcon-bash` guard**: at handler start-up, check whether `setup.bash` will
+  be generated (i.e. `colcon-bash` is available) and warn the user if not,
+  rather than letting the wrapper fail at runtime.
+
+### Features
+- **`install` sub-command / helper**: add a `colcon systemd install` convenience
+  command that symlinks the generated `.service` files into
+  `~/.config/systemd/user/` and runs `systemctl --user daemon-reload`.
+- **System-level deployment**: add an `install_mode` option (`user` / `system`)
+  to the YAML config; for `system` mode, generate units with `User=` and
+  `Group=` directives and document how to copy them to `/etc/systemd/system`.
+- **`wants` / `requires` relationships**: support `Wants=` and `Requires=`
+  between services in the same workspace (e.g. a DDS discovery node that other
+  nodes depend on).
+- **`EnvironmentFile=` support**: allow loading env vars from a file path in
+  addition to inline `Environment=` directives — useful for secrets or
+  machine-specific configuration.
+- **Multi-workspace overlays**: document and/or support sourcing a chain of
+  `setup.bash` files when a ROS 2 underlay is involved.
+
+### Developer Experience
+- **Publish to PyPI**: make the package available via `pip install colcon-systemd`.
+- **`colcon-argcomplete` integration**: register tab-completion hints for the
+  `--event-handlers systemd+/systemd-` flags.
+- **Pre-built example workspace**: add a `examples/` directory with a
+  ready-to-clone multi-package ROS 2 workspace that demonstrates the full
+  workflow end-to-end.
+- **VS Code / devcontainer integration**: provide a `.devcontainer/` that
+  installs all prerequisites so contributors can get started with one click.
 
 ## License
 

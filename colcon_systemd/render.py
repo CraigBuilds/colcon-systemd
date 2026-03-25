@@ -82,7 +82,11 @@ def _resolve_executable_path(
     layout.
     """
     ep = service.entry_point or service.executable
-    assert ep is not None
+    if ep is None:
+        raise ValueError(
+            f"Service '{service.name}' has neither entry_point nor executable; "
+            "this is a validation bug — parse_config should have caught it."
+        )
     return str(install_base / "lib" / package_name / ep)
 
 
