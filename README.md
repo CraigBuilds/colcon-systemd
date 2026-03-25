@@ -143,6 +143,101 @@ systemctl --user status my_node
 
 This uses `systemctl --user`, which does not require root.
 
+### 5. Managing the Service
+
+All service management is done with `systemctl --user` — no root required.
+
+#### Checking service status
+
+```bash
+systemctl --user status my_node
+```
+
+This shows whether the service is active, any recent log lines, and the PID of
+the running process.
+
+#### Viewing logs (output)
+
+Service output (stdout and stderr) is captured by the systemd journal.  Use
+`journalctl` to read it:
+
+```bash
+# All logs for the service (most recent first):
+journalctl --user -u my_node
+
+# Follow live output (like `tail -f`):
+journalctl --user -u my_node -f
+
+# Show only the last 50 lines:
+journalctl --user -u my_node -n 50
+
+# Show logs since the last boot:
+journalctl --user -u my_node -b
+```
+
+#### Stopping the service
+
+```bash
+systemctl --user stop my_node
+```
+
+This sends `SIGTERM` to the process and waits for it to exit cleanly.  Because
+the wrapper script uses `exec`, systemd tracks the real node PID directly, so
+the signal is always delivered to the correct process.
+
+#### Restarting the service
+
+```bash
+systemctl --user restart my_node
+```
+
+#### Sending a specific signal (force-kill)
+
+If the process is unresponsive and `stop` does not work within the timeout, you
+can send `SIGKILL` directly:
+
+```bash
+systemctl --user kill --signal=SIGKILL my_node
+```
+
+You can also send any other signal by replacing `SIGKILL` with the signal name,
+e.g. `SIGINT` or `SIGHUP`.
+
+#### Enabling auto-start on login
+
+To start the service automatically when your user session begins (requires
+[systemd lingering](https://www.freedesktop.org/software/systemd/man/loginctl.html)
+for headless or non-interactive logins):
+
+```bash
+systemctl --user enable my_node
+```
+
+To disable auto-start:
+
+```bash
+systemctl --user disable my_node
+```
+
+> **Note:** For the service to start on boot without an interactive login
+> session (e.g. on a robot or server), enable lingering for your user:
+> `sudo loginctl enable-linger $USER`.
+
+#### Removing the service
+
+To unregister the service entirely:
+
+```bash
+systemctl --user stop my_node
+systemctl --user disable my_node
+rm ~/.config/systemd/user/my_node.service
+systemctl --user daemon-reload
+```
+
+The generated files in the install tree
+(`install/<pkg>/share/colcon-systemd/`) are not affected and can be
+re-symlinked at any time.
+
 ## Complete Example
 
 This section shows a realistic input configuration and the exact files that
