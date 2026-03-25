@@ -282,5 +282,8 @@ class TestParseConfigErrors:
                 entry_point: test
                 args: 42
         """)
-        with pytest.raises(ConfigError, match="'args' must be a list of strings"):
+        with pytest.raises(
+            ConfigError,
+            match="'args' must be a list of strings( or a single string)?",
+        ):
             parse_config(cfg)
