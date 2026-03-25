@@ -127,8 +127,11 @@ check "WantedBy=default.target"      grep -q "WantedBy=default.target" "$SERVICE
 # Validate with systemd-analyze if available
 if command -v systemd-analyze &>/dev/null; then
     # systemd-analyze may warn about missing paths; we only care about hard errors
-    ANALYZE_OUTPUT=$(systemd-analyze verify --user "$SERVICE_FILE" 2>&1 || true)
-    ANALYZE_RC=$?
+    if ANALYZE_OUTPUT=$(systemd-analyze verify --user "$SERVICE_FILE" 2>&1); then
+        ANALYZE_RC=0
+    else
+        ANALYZE_RC=$?
+    fi
     check "systemd-analyze verify passes" test "$ANALYZE_RC" -eq 0
 fi
 
