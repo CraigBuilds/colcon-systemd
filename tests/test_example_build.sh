@@ -22,9 +22,9 @@ cp -r "$REPO_ROOT/examples/my_node" "$WORKSPACE/src/my_node"
 # --break-system-packages is required when running inside the ros:jazzy
 # Docker container (Ubuntu 24.04), which enforces PEP 668.  The container
 # is a fully isolated test environment, so bypassing the guard is safe.
-pip install -e "$REPO_ROOT" --quiet --break-system-packages 2>&1 | tail -1
+pip install -e "$REPO_ROOT" --quiet --break-system-packages 2>&1
 pip install colcon-python-setup-py colcon-bash colcon-recursive-crawl \
-    --quiet --break-system-packages 2>&1 | tail -1
+    --quiet --break-system-packages 2>&1
 
 # Build the workspace
 cd "$WORKSPACE"
