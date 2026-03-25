@@ -74,6 +74,7 @@ class TestRenderWrapperScript:
             merge_install=True,
         )
         assert f'source "{install_root}/setup.bash"' in script
+        assert f'exec "{install_root}/lib/my_pkg/my_node"' in script
 
 
 # ---------------------------------------------------------------------------
