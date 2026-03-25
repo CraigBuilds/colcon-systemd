@@ -360,52 +360,89 @@ pytest tests/ -v
 
 ## Recommended Next Steps
 
-The following improvements would take this plugin from beta to production-ready:
+The following improvements would take this plugin from beta to production-ready.
+Items within each category are listed in approximate priority order — tackle
+higher items first.
 
 ### Robustness
-- **Post-generation validation**: after writing the wrapper script, verify that
-  the target executable actually exists in the install tree and emit a clear
-  warning (not a silent failure) when it doesn't.
-- **Atomic writes**: write files to a `.tmp` path and rename atomically so that
-  a partial failure never leaves a half-written service unit on disk.
-- **`colcon-bash` guard**: at handler start-up, check whether `setup.bash` will
-  be generated (i.e. `colcon-bash` is available) and warn the user if not,
-  rather than letting the wrapper fail at runtime.
+
+- **`colcon-bash` guard** *(high priority)*: at handler start-up, check whether
+  `setup.bash` will be generated (i.e. `colcon-bash` is installed and active)
+  and warn the user immediately if not, rather than letting every generated
+  wrapper script fail silently at runtime.
+- **Post-generation validation** *(high priority)*: after writing the wrapper
+  script, verify that the target executable actually exists in the install tree
+  and emit a clear warning (not a silent failure) when it doesn't.
+- **Dry-run / preview mode** *(medium priority)*: add a `--dry-run` flag (or
+  honour colcon's own dry-run mechanism) so users can see which files *would* be
+  generated without actually writing anything to disk.
+- **Atomic writes** *(medium priority)*: write files to a `.tmp` path and rename
+  atomically so that a partial failure never leaves a half-written service unit
+  on disk.
+- **Idempotent regeneration** *(low priority)*: skip writing a file when its
+  content is identical to what is already on disk, so that repeated `colcon
+  build` invocations do not unnecessarily touch files and trigger downstream
+  watchers.
 
 ### Features
-- **`ros2 run` support**: add an opt-in `launch_via: ros2_run` field in the
-  YAML config that generates an `ExecStart` using `ros2 run <pkg> <executable>`
-  instead of a direct wrapper script.  This would be useful for workflows where
-  the `ros2` CLI is guaranteed to be present and users want `ros2 run`'s
-  automatic component/launch integration, remapping sugar, or parity with
-  `ros2 launch` tooling.  The trade-offs (extra process layer, PID tracking
-  caveats, signal delivery) are documented in the
-  [Why Not `ros2 run`?](#why-not-ros2-run) section above and would need to be
-  explicitly acknowledged by the user when enabling this mode.
-- **`install` sub-command / helper**: add a `colcon systemd install` convenience
-  command that symlinks the generated `.service` files into
-  `~/.config/systemd/user/` and runs `systemctl --user daemon-reload`.
-- **System-level deployment**: add an `install_mode` option (`user` / `system`)
-  to the YAML config; for `system` mode, generate units with `User=` and
-  `Group=` directives and document how to copy them to `/etc/systemd/system`.
-- **`wants` / `requires` relationships**: support `Wants=` and `Requires=`
-  between services in the same workspace (e.g. a DDS discovery node that other
-  nodes depend on).
-- **`EnvironmentFile=` support**: allow loading env vars from a file path in
-  addition to inline `Environment=` directives — useful for secrets or
-  machine-specific configuration.
-- **Multi-workspace overlays**: document and/or support sourcing a chain of
-  `setup.bash` files when a ROS 2 underlay is involved.
+
+- **`colcon systemd install` sub-command** *(high priority)*: add a `colcon
+  systemd install` convenience command that symlinks the generated `.service`
+  files into `~/.config/systemd/user/` and runs `systemctl --user
+  daemon-reload`, removing the manual steps currently required after every
+  build.
+- **System-level deployment** *(high priority)*: add an `install_mode` option
+  (`user` / `system`) to the YAML config; for `system` mode, generate units
+  with `User=` and `Group=` directives and document how to copy them to
+  `/etc/systemd/system`.
+- **`EnvironmentFile=` support** *(medium priority)*: allow loading environment
+  variables from a file path (via systemd's `EnvironmentFile=` directive) in
+  addition to inline `Environment=` key/value pairs — useful for secrets or
+  machine-specific configuration that should not be committed to the workspace.
+- **`wants` / `requires` relationships** *(medium priority)*: support `Wants=`
+  and `Requires=` between services in the same workspace (e.g. a DDS discovery
+  node that other nodes depend on) so that startup ordering is expressed in the
+  unit files rather than left to the operator.
+- **Resource limits** *(medium priority)*: expose commonly used resource-control
+  directives — `CPUQuota=`, `MemoryMax=`, `TasksMax=` — as optional fields in
+  the YAML config so nodes can be sandboxed without hand-editing unit files.
+- **Graceful shutdown configuration** *(medium priority)*: add a
+  `timeout_stop_sec` field that maps to systemd's `TimeoutStopSec=`, giving
+  nodes a configurable window to handle `SIGTERM` before systemd sends `SIGKILL`.
+- **Watchdog support** *(low priority)*: add optional `WatchdogSec=` generation
+  so nodes that implement the systemd watchdog protocol (`sd_notify`) can be
+  automatically restarted if they become unresponsive.
+- **Timer units** *(low priority)*: allow a service config to opt into a paired
+  `.timer` unit (with a `schedule` field accepting OnCalendar / OnBootSec
+  expressions) for periodic or one-shot execution without requiring a separate
+  cron entry.
+- **`ros2 run` support** *(low priority)*: add an opt-in `launch_via: ros2_run`
+  field in the YAML config that generates an `ExecStart` using
+  `ros2 run <pkg> <executable>` instead of a direct wrapper script.  The
+  trade-offs (extra process layer, PID tracking caveats, signal delivery) are
+  documented in the [Why Not `ros2 run`?](#why-not-ros2-run) section above and
+  would need to be explicitly acknowledged by the user when enabling this mode.
+- **Multi-workspace overlays** *(low priority)*: document and/or support
+  sourcing a chain of `setup.bash` files when a ROS 2 underlay is involved.
 
 ### Developer Experience
-- **Publish to PyPI**: make the package available via `pip install colcon-systemd`.
-- **`colcon-argcomplete` integration**: register tab-completion hints for the
-  `--event-handlers systemd+/systemd-` flags.
-- **Pre-built example workspace**: add a `examples/` directory with a
-  ready-to-clone multi-package ROS 2 workspace that demonstrates the full
-  workflow end-to-end.
-- **VS Code / devcontainer integration**: provide a `.devcontainer/` that
-  installs all prerequisites so contributors can get started with one click.
+
+- **Publish to PyPI** *(high priority)*: make the package available via
+  `pip install colcon-systemd` so users do not need to install from source.
+- **Pre-built example workspace** *(high priority)*: add an `examples/`
+  directory with a ready-to-clone multi-package ROS 2 workspace that
+  demonstrates the full workflow end-to-end, lowering the barrier for new users.
+- **Contributing guide** *(medium priority)*: add a `CONTRIBUTING.md` that
+  documents how to set up a development environment, run the test suite, and
+  submit a pull request, so that external contributors can get started quickly.
+- **VS Code / devcontainer integration** *(medium priority)*: provide a
+  `.devcontainer/` configuration that installs all prerequisites automatically
+  so contributors can get a working environment with one click.
+- **Changelog** *(low priority)*: maintain a `CHANGELOG.md` (following
+  [Keep a Changelog](https://keepachangelog.com) conventions) so users can see
+  what changed between releases at a glance.
+- **`colcon-argcomplete` integration** *(low priority)*: register tab-completion
+  hints for the `--event-handlers systemd+/systemd-` flags.
 
 ## License
 
