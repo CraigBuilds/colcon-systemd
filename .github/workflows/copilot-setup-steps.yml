@@ -13,17 +13,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install colcon-systemd and test dependencies
+      - name: Install colcon-systemd dependencies
         run: |
           apt-get update -q
           apt-get install -y -q python3-pip python3-numpy
           python3 -m pip install --break-system-packages -e ".[test]"
           python3 -m pip install --break-system-packages \
             colcon-python-setup-py colcon-bash colcon-recursive-crawl
-
-      - name: Verify environment
-        run: |
-          . /opt/ros/jazzy/setup.sh
-          colcon --help
-          python3 -c "import colcon_systemd; print('colcon-systemd importable')"
-          pytest --version
