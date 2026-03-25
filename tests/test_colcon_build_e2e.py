@@ -4,12 +4,12 @@
 Pytest wrapper for the colcon build end-to-end bash test.
 
 This calls tests/test_colcon_build_e2e.sh which:
-  1. Creates a temp colcon workspace with test_packages/simple_node
-  2. Runs `colcon build`
+  1. Creates a temp colcon workspace with test_packages/simple_node (ROS 2 node)
+  2. Runs `colcon build` with ROS 2 sourced
   3. Verifies generated .service and .sh files
   4. Validates .service file content
-  5. Runs the wrapper script (one-shot) to confirm environment sourcing works
-  6. Installs the .service and starts/stops it via systemctl --user
+  5. Installs the .service, starts it via systemctl --user, verifies the ROS 2
+     node is on the graph and publishing, then stops it via systemctl --user
 """
 
 import platform
