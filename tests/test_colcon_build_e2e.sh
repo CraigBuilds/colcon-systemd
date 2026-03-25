@@ -58,8 +58,9 @@ cp -r "$REPO_ROOT/test_packages/$PKG_NAME" "$WORKSPACE/src/$PKG_NAME"
 
 # Ensure colcon-systemd is installed
 pip install -e "$REPO_ROOT" --quiet 2>&1 | tail -1
-# Ensure colcon can build Python packages and generates setup.bash
-pip install colcon-python-setup-py colcon-bash --quiet 2>&1 | tail -1
+# Ensure colcon can build Python packages, discover them recursively,
+# and generate setup.bash
+pip install colcon-python-setup-py colcon-bash colcon-recursive-crawl --quiet 2>&1 | tail -1
 
 echo "  Workspace ready."
 
