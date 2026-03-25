@@ -223,7 +223,9 @@ if $ACTIVE; then
     # Confirm the underlying process is actually running by checking its MainPID
     MAIN_PID=$(systemctl --user show -p MainPID --value "${SERVICE_UNIT}" 2>/dev/null || echo 0)
     check "service MainPID is non-zero" test "${MAIN_PID:-0}" -gt 0
-    check "service process is alive" kill -0 "$MAIN_PID" 2>/dev/null
+    if [[ "${MAIN_PID:-0}" -gt 0 ]]; then
+        check "service process is alive" kill -0 "$MAIN_PID" 2>/dev/null
+    fi
 
     # Wait a moment for heartbeat output, then stop the service
     sleep 1
