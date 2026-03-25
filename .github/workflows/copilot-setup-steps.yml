@@ -8,8 +8,8 @@ permissions:
 jobs:
   copilot-setup-steps:
     runs-on: ubuntu-latest
-    #container:
-      #image: ros:jazzy
+    container:
+      image: ros:jazzy
     steps:
       - uses: actions/checkout@v4
 
