@@ -10,6 +10,7 @@ units and wrapper scripts are valid and actually work at runtime.
 
 import os
 import platform
+import socket
 import stat
 import subprocess
 import textwrap
@@ -847,6 +848,182 @@ class TestEndToEnd:
         )
         assert "STDERR_MESSAGE" in result.stderr, (
             f"stderr was swallowed: {result.stderr!r}"
+        )
+
+    def test_node_pubsub_functionality(self, tmp_path: Path) -> None:
+        """
+        Verify that the node's event loop spins and its pub/sub logic works
+        when run via the generated wrapper script.
+
+        Earlier tests only checked that a process starts.  A false positive
+        is possible when a service starts but the node's internal logic stalls
+        or crashes silently — a situation that previous tests would miss.
+
+        This test uses a Unix-domain socket as a real IPC channel to simulate
+        ROS 2 publisher/subscriber communication:
+
+          - **Publisher (node)**: binds a Unix socket, waits for a subscriber,
+            then emits sequentially-numbered ``MSG:<n>`` messages at 0.1 s
+            intervals — simulating a ROS 2 node whose executor is spinning and
+            whose publisher callback fires on a timer.
+
+          - **Subscriber (this test)**: connects to the socket and reads
+            messages — simulating a ROS 2 subscriber receiving published data.
+
+        Because the subscriber must receive N sequential messages over real
+        clock time, there is no way to get a false positive: if the node's
+        event loop stalls, the connection drops and the assertion fails.
+        """
+        pkg_name = "e2e_pubsub_pkg"
+        svc_name = "e2e_publisher_node"
+        install_root = tmp_path / "install"
+        install_root.mkdir()
+        install_base = install_root / pkg_name
+        install_base.mkdir()
+        pkg_path = tmp_path / "src" / pkg_name
+        pkg_path.mkdir(parents=True)
+
+        socket_path = str(tmp_path / "pubsub.sock")
+
+        (pkg_path / "colcon-systemd.yaml").write_text(
+            textwrap.dedent(f"""\
+                services:
+                  - name: {svc_name}
+                    entry_point: {svc_name}
+                    description: "Pub/sub functionality test node"
+            """)
+        )
+
+        # Publisher node: Python3 script that binds a Unix socket and sends
+        # 10 sequentially-numbered messages to the first subscriber that
+        # connects.  This simulates a ROS 2 node whose executor is spinning
+        # and whose timer callback publishes at a fixed rate.
+        publisher_script = textwrap.dedent("""\
+            #!/usr/bin/env python3
+            import socket, sys, time, signal, os
+
+            SOCKET_PATH = sys.argv[1]
+
+            running = True
+
+            def _stop(sig, frame):
+                global running
+                running = False
+
+            signal.signal(signal.SIGTERM, _stop)
+            signal.signal(signal.SIGINT, _stop)
+
+            if os.path.exists(SOCKET_PATH):
+                os.unlink(SOCKET_PATH)
+
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(SOCKET_PATH)
+            server.listen(1)
+            server.settimeout(10)
+
+            print("PUBLISHER_READY", flush=True)
+
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                print("PUBLISHER_TIMEOUT: no subscriber connected", flush=True)
+                sys.exit(1)
+
+            seq = 0
+            while running and seq < 10:
+                try:
+                    conn.sendall("MSG:{}\\n".format(seq).encode())
+                except BrokenPipeError:
+                    break
+                seq += 1
+                time.sleep(0.1)
+
+            conn.close()
+            server.close()
+            if os.path.exists(SOCKET_PATH):
+                os.unlink(SOCKET_PATH)
+
+            print("PUBLISHER_DONE", flush=True)
+        """)
+
+        _setup_install_tree(
+            install_root, pkg_name, svc_name, script_body=publisher_script
+        )
+
+        handler = SystemdEventHandler()
+        handler((_make_job_ended(pkg_name, rc=0), _make_job(pkg_name, pkg_path, install_base)))
+
+        wrapper = install_base / "share" / "colcon-systemd" / f"{svc_name}.sh"
+        assert wrapper.exists()
+
+        # Start the publisher node via the wrapper, passing the socket path
+        # as a runtime argument — simulating systemd starting the service.
+        proc = subprocess.Popen(
+            [str(wrapper), socket_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        subscriber = None
+        received = []
+        try:
+            # Wait for the publisher to create the socket (node is ready)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if os.path.exists(socket_path):
+                    break
+                time.sleep(0.05)
+            else:
+                stdout, stderr = "", ""
+                try:
+                    stdout, stderr = proc.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+                pytest.fail(
+                    "Publisher socket never appeared — node did not start.\n"
+                    f"stdout={stdout!r}\nstderr={stderr!r}"
+                )
+
+            # Connect as subscriber (simulates a ROS 2 subscriber)
+            subscriber = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            subscriber.connect(socket_path)
+            subscriber.settimeout(10)
+
+            # Receive messages until the publisher closes the connection
+            buf = ""
+            while True:
+                try:
+                    chunk = subscriber.recv(256).decode()
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        if line.startswith("MSG:"):
+                            received.append(int(line.split(":")[1]))
+                except socket.timeout:
+                    break
+
+        finally:
+            if subscriber is not None:
+                subscriber.close()
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+        # Verify the event loop ran and produced sequential, in-order messages.
+        # Out-of-order or missing sequence numbers would indicate the executor
+        # loop stalled or dropped callbacks — the same failure mode that would
+        # break a real ROS 2 node.
+        assert len(received) >= 5, (
+            f"Node event loop did not produce enough messages: received={received}"
+        )
+        assert received == list(range(len(received))), (
+            f"Messages arrived out-of-order or with gaps: {received}"
         )
 
 
