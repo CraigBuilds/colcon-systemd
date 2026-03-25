@@ -245,6 +245,28 @@ exec "/path/to/install/my_pkg/lib/my_pkg/my_node" "$@"
 The systemd unit's `ExecStart` calls this wrapper, so systemd tracks the real
 process PID and can send signals directly.
 
+### Why Not `ros2 run`?
+
+`ros2 run` adds an extra process layer between systemd and your node, which
+causes several problems in a service-management context:
+
+- **PID tracking:** systemd records the PID of the process launched by
+  `ExecStart`.  When you use `ros2 run`, systemd tracks the `ros2` CLI process,
+  not the node itself.  This means `systemctl status`, `systemctl stop`, and
+  cgroup-based resource limits all operate on the wrong process.
+- **Signal delivery:** `SIGTERM` (the default stop signal) is sent to the PID
+  that systemd is tracking.  With a `ros2 run` wrapper in between, the signal
+  may not reach the actual node process, leading to slow or missed shutdowns.
+- **Runtime CLI dependency:** `ros2 run` requires the full `ros2` CLI to be
+  installed and on `$PATH` at service startup.  Direct execution removes this
+  runtime dependency — only the colcon install tree needs to be present.
+- **Unnecessary overhead:** Launching an extra interpreter just to `exec` the
+  real binary adds latency and a second process to the process table for the
+  duration of startup.
+
+The wrapper-script approach gives the same environment setup (sourcing
+`setup.bash`) without any of these drawbacks.
+
 ### Python and C++ Nodes
 
 Both are fully supported:
@@ -351,6 +373,15 @@ The following improvements would take this plugin from beta to production-ready:
   rather than letting the wrapper fail at runtime.
 
 ### Features
+- **`ros2 run` support**: add an opt-in `launch_via: ros2_run` field in the
+  YAML config that generates an `ExecStart` using `ros2 run <pkg> <executable>`
+  instead of a direct wrapper script.  This would be useful for workflows where
+  the `ros2` CLI is guaranteed to be present and users want `ros2 run`'s
+  automatic component/launch integration, remapping sugar, or parity with
+  `ros2 launch` tooling.  The trade-offs (extra process layer, PID tracking
+  caveats, signal delivery) are documented in the
+  [Why Not `ros2 run`?](#why-not-ros2-run) section above and would need to be
+  explicitly acknowledged by the user when enabling this mode.
 - **`install` sub-command / helper**: add a `colcon systemd install` convenience
   command that symlinks the generated `.service` files into
   `~/.config/systemd/user/` and runs `systemctl --user daemon-reload`.
